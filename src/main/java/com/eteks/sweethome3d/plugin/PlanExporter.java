@@ -294,6 +294,24 @@ public class PlanExporter {
                     logWriter.flush();
                 }
             }
+            // Si fichier vide (aucun mur), ajouter un mur par défaut 5 m × 2 m × 0,2 m
+            if (sh3dWalls.isEmpty()) {
+                if (logWriter != null) {
+                    logWriter.println("  Ajout d'un mur par défaut (5 m × 2 m × 0,2 m)...");
+                    logWriter.flush();
+                }
+                Object defaultWall = createWallAtOrigin(5.0, 2.0, 0.2, foundation, logWriter);
+                if (defaultWall != null) {
+                    java.lang.reflect.Method getChildrenMethod = foundationClass.getMethod("getChildren");
+                    @SuppressWarnings("unchecked")
+                    java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(foundation);
+                    children.add(defaultWall);
+                    wallCount = 1;
+                    if (logWriter != null) { logWriter.println("  ✓ Mur par défaut ajouté"); logWriter.flush(); }
+                } else if (logWriter != null) {
+                    logWriter.println("  ⚠ Impossible de créer le mur par défaut"); logWriter.flush();
+                }
+            }
             
             logWriter.println("✓ " + wallCount + " murs convertis");
             logWriter.flush();
@@ -317,9 +335,11 @@ public class PlanExporter {
             logWriter.println("✓ Foundation ajoutée à la Scene");
             logWriter.flush();
             
-            // Caméra pour scale 0.2 (unités natives) : -40, 10 ≈ 8 m derrière, 2 m hauteur
-            setExportedSceneCamera(sceneClass, scene, logWriter, -40, 10);
             ensureSceneAnnotationScale(sceneClass, scene, 0.2, logWriter);
+            
+            // Caméra (comme plan_energy.ng3) : définie juste avant sérialisation pour être bien persistée
+            setExportedSceneCamera(sceneClass, scene, logWriter, 14.69, -139.37, 41.82);
+            setSceneCameraFieldsByReflection(sceneClass, scene, 14.69, -139.37, 41.82, logWriter);
             
             // Sérialiser la Scene exactement comme Energy3D le fait
             logWriter.println("Sérialisation de la Scene vers: " + outputFile.getAbsolutePath());
@@ -599,9 +619,10 @@ public class PlanExporter {
                 return exportEmptyNg3(outputFile);
             }
             
-            // Caméra pour fondation 10×10 m (50×50 unités, scale 0.2)
-            setExportedSceneCamera(sceneClass, scene, logWriter, -25, 10);
+            // Caméra pour fondation 10×10 m (50×50 unités scale 0.2)
+            setExportedSceneCamera(sceneClass, scene, logWriter, 0, -40, 10);
             ensureSceneAnnotationScale(sceneClass, scene, 0.2, logWriter);
+            setSceneCameraFieldsByReflection(sceneClass, scene, 0, -40, 10, logWriter);
             
             boolean ok = serializeSceneToNG3(scene, outputFile, logWriter);
             if (logWriter != null) {
@@ -736,6 +757,7 @@ public class PlanExporter {
             populateSceneAsEnergy3DDefault(sceneClass, scene, logWriter);
             // Caméra pour 16 m x 12 m (scale 0.2) : camY=-40, camZ=10 unités ≈ 8 m derrière, 2 m hauteur
             setExportedSceneCamera(sceneClass, scene, logWriter, -40, 10);
+            setSceneCameraFieldsByReflection(sceneClass, scene, 0, -40, 10, logWriter);
             if (outputFile.exists()) {
                 outputFile.delete();
             }
@@ -822,13 +844,13 @@ public class PlanExporter {
                 logWriter.println("INFO: Scene.instance déjà défini: " + existing.getClass().getName());
                 logWriter.flush();
             }
-            // Unités natives Energy3D : annotationScale 0.2, 1 m = 5 unités → grille 5 unités = 1 m (pas 25 m)
+            // Aligner sur plan_energy.ng3 (Energy3D) : annotationScale 0.2, 1 m = 5 unités (grille 1 m)
             try {
                 java.lang.reflect.Field scaleField = sceneClass.getDeclaredField("annotationScale");
                 scaleField.setAccessible(true);
                 scaleField.set(sceneInstance, 0.2);
                 if (logWriter != null) {
-                    logWriter.println("✓ Scene.annotationScale = 0.2 (géométrie: 1 m = 5 unités, grille 1 m)");
+                    logWriter.println("✓ Scene.annotationScale = 0.2 (comme Energy3D, 1 m = 5 unités)");
                     logWriter.flush();
                 }
             } catch (Exception e) {
@@ -872,11 +894,10 @@ public class PlanExporter {
      * Sans cela, Energy3D utilise la valeur par défaut (0, -100, 25) et la scène paraît très loin.
      * @param camY distance caméra (négatif = derrière), camZ hauteur
      */
-    private static void setExportedSceneCamera(Class<?> sceneClass, Object scene, PrintWriter logWriter, double camY, double camZ) {
+    private static void setExportedSceneCamera(Class<?> sceneClass, Object scene, PrintWriter logWriter, double camX, double camY, double camZ) {
         try {
             ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader(logWriter);
             Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
-            double camX = 0;
             Object loc = vector3Class.getConstructor(double.class, double.class, double.class).newInstance(camX, camY, camZ);
             // Direction = vecteur normalisé de la caméra vers le centre
             double dx = -camX, dy = -camY, dz = -camZ;
@@ -888,7 +909,7 @@ public class PlanExporter {
             sceneClass.getMethod("setCameraLocation", loader.loadClass("com.ardor3d.math.ReadOnlyVector3")).invoke(scene, loc);
             sceneClass.getMethod("setCameraDirection", loader.loadClass("com.ardor3d.math.ReadOnlyVector3")).invoke(scene, dir);
             if (logWriter != null) {
-                logWriter.println("✓ Scene: caméra position (0, " + camY + ", " + camZ + "), direction vers centre");
+                logWriter.println("✓ Scene: caméra position (" + camX + ", " + camY + ", " + camZ + "), direction vers centre");
                 logWriter.flush();
             }
         } catch (Exception e) {
@@ -898,10 +919,46 @@ public class PlanExporter {
             }
         }
     }
+
+    private static void setExportedSceneCamera(Class<?> sceneClass, Object scene, PrintWriter logWriter, double camY, double camZ) {
+        setExportedSceneCamera(sceneClass, scene, logWriter, 0, camY, camZ);
+    }
     
-    /** Caméra par défaut : scale 0.2 → -40, 10 ≈ 8 m derrière, 2 m hauteur. */
+    /** Caméra par défaut (scale 0.2, comme plan_energy.ng3). */
     private static void setExportedSceneCamera(Class<?> sceneClass, Object scene, PrintWriter logWriter) {
-        setExportedSceneCamera(sceneClass, scene, logWriter, -40, 10);
+        setExportedSceneCamera(sceneClass, scene, logWriter, 14.69, -139.37, 41.82);
+    }
+    
+    /**
+     * Définit cameraLocation et cameraDirection directement sur la Scene par réflexion
+     * (champs sérialisés par defaultWriteObject), pour garantir leur persistance dans le .ng3.
+     */
+    private static void setSceneCameraFieldsByReflection(Class<?> sceneClass, Object scene,
+            double camX, double camY, double camZ, PrintWriter logWriter) {
+        try {
+            ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader(logWriter);
+            Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
+            Object loc = vector3Class.getConstructor(double.class, double.class, double.class).newInstance(camX, camY, camZ);
+            double dx = -camX, dy = -camY, dz = -camZ;
+            double len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+            if (len > 1e-6) { dx /= len; dy /= len; dz /= len; }
+            Object dir = vector3Class.getConstructor(double.class, double.class, double.class).newInstance(dx, dy, dz);
+            java.lang.reflect.Field locField = sceneClass.getDeclaredField("cameraLocation");
+            java.lang.reflect.Field dirField = sceneClass.getDeclaredField("cameraDirection");
+            locField.setAccessible(true);
+            dirField.setAccessible(true);
+            locField.set(scene, loc);
+            dirField.set(scene, dir);
+            if (logWriter != null) {
+                logWriter.println("✓ Scene.cameraLocation / cameraDirection fixés par réflexion (sérialisation)");
+                logWriter.flush();
+            }
+        } catch (Exception e) {
+            if (logWriter != null) {
+                logWriter.println("⚠ setSceneCameraFieldsByReflection: " + e.getMessage());
+                logWriter.flush();
+            }
+        }
     }
 
     private static Object createDefaultFoundation(PrintWriter logWriter) {
@@ -1217,7 +1274,7 @@ public class PlanExporter {
             }
             
             // Tenter d'abord le constructeur Foundation(double, double) pour éviter l'appel à addPoint
-            // Unités natives (scale 0.2) : 1 m = 5 unités → grille 5 u = 1 m
+            // Comme plan_energy.ng3 (scale 0.2) : 1 m = 5 unités → fondation 10×10 m = 50×50 u
             final double UNITS_PER_M = 5.0;
             double widthUnits = widthMeters * UNITS_PER_M;
             double heightUnits = heightMeters * UNITS_PER_M;
@@ -1225,7 +1282,7 @@ public class PlanExporter {
             try {
                 java.lang.reflect.Constructor<?> ctor = foundationClass.getConstructor(double.class, double.class);
                 Object foundation = ctor.newInstance(widthUnits, heightUnits);
-                // Épaisseur fondation 0,2 m = 1 unité (scale 0.2)
+                // Épaisseur fondation 0,2 m = 1 unité (scale 0.2, comme référence)
                 final double DEFAULT_FOUNDATION_THICKNESS_M = 0.2;
                 double foundationHeightUnits = DEFAULT_FOUNDATION_THICKNESS_M * UNITS_PER_M;
                 try {
@@ -1274,8 +1331,10 @@ public class PlanExporter {
         }
     }
     
-    /** Unités natives Energy3D (scale 0.2) : 1 m = 5 unités → grille 5 u = 1 m. */
+    /** Comme plan_energy.ng3 (scale 0.2) : 1 m = 5 unités (fondation, hauteur mur). */
     private static final double ENERGY3D_UNITS_PER_METER = 5.0;
+    /** Longueur mur : 1 unité = 5 m affiché (référence plan_energy.ng3 a mur (0,0,1)→(1,0,1) = 5 m). */
+    private static final double WALL_LENGTH_UNITS_PER_METER = 0.2;
     
     /**
      * Crée un mur posé sur l'origine (départ en (0,0), longueur le long de X).
@@ -1289,7 +1348,7 @@ public class PlanExporter {
     private static Object createWallAtOrigin(double lengthMeters, double heightMeters, double thicknessMeters,
             Object foundation, PrintWriter logWriter) {
         try {
-            double lengthUnits = lengthMeters * ENERGY3D_UNITS_PER_METER;
+            double lengthUnits = lengthMeters * WALL_LENGTH_UNITS_PER_METER;
             double heightUnits = heightMeters * ENERGY3D_UNITS_PER_METER;
             double thicknessUnits = thicknessMeters * ENERGY3D_UNITS_PER_METER;
             // Mur le long de X : de (0,0,0) à (lengthUnits, 0, 0), hauteur heightUnits
@@ -1605,17 +1664,19 @@ public class PlanExporter {
         }
     }
     
-    /** Unités natives Energy3D (scale 0.2) : 100 cm = 5 unités, 1 m = 5 u → grille 1 m. */
+    /** Comme plan_energy.ng3 (scale 0.2) : 100 cm = 5 unités, 1 m = 5 u (fondation, hauteur). */
     private static final double SCALE_CM_TO_ENERGY3D = 0.05;
+    /** Longueur mur (x,y) : 100 cm = 0,2 unité → 1 u = 5 m affiché (comme référence). */
+    private static final double WALL_LENGTH_SCALE_CM = 0.002;
 
     private static Object convertWallToEnergy3D(Wall sh3dWall, Object foundation, PrintWriter logWriter) {
         try {
             // Données dimensionnelles depuis Sweet Home 3D (x, y, longueur, épaisseur, hauteur)
             WallConverter.Energy3DWallData data = WallConverter.convertToEnergy3D(sh3dWall);
-            double xStart = sh3dWall.getXStart() * SCALE_CM_TO_ENERGY3D;
-            double yStart = sh3dWall.getYStart() * SCALE_CM_TO_ENERGY3D;
-            double xEnd   = sh3dWall.getXEnd()   * SCALE_CM_TO_ENERGY3D;
-            double yEnd   = sh3dWall.getYEnd()   * SCALE_CM_TO_ENERGY3D;
+            double xStart = sh3dWall.getXStart() * WALL_LENGTH_SCALE_CM;
+            double yStart = sh3dWall.getYStart() * WALL_LENGTH_SCALE_CM;
+            double xEnd   = sh3dWall.getXEnd()   * WALL_LENGTH_SCALE_CM;
+            double yEnd   = sh3dWall.getYEnd()   * WALL_LENGTH_SCALE_CM;
             // Épaisseur mur : SH3D en cm ; défaut 0,2 m = 20 cm si non définie
             double thicknessCm = data.wallThickness > 0 ? data.wallThickness : 20.0;
             double thickness = thicknessCm * SCALE_CM_TO_ENERGY3D;

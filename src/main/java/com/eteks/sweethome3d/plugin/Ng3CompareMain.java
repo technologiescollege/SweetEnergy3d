@@ -61,9 +61,9 @@ public class Ng3CompareMain {
             Object p = parts.get(i);
             if (foundationClass.isInstance(p)) {
                 System.out.println("  Part[" + i + "] Foundation:");
-                dumpFoundation(p, foundationClass);
+                dumpFoundation(p, foundationClass, loader);
             } else if (wallClass.isInstance(p)) {
-                System.out.println("  Part[" + i + "] Wall (sur fondation):");
+                System.out.println("  Part[" + i + "] Wall (top-level):");
                 dumpWall(p, wallClass);
             }
         }
@@ -80,7 +80,7 @@ public class Ng3CompareMain {
         return String.format("(%.4f, %.4f, %.4f)", x, y, z);
     }
 
-    static void dumpFoundation(Object f, Class<?> foundationClass) throws Exception {
+    static void dumpFoundation(Object f, Class<?> foundationClass, ClassLoader loader) throws Exception {
         Method getHeight = foundationClass.getSuperclass().getMethod("getHeight");
         double h = ((Number) getHeight.invoke(f)).doubleValue();
         System.out.println("    height = " + h);
@@ -101,6 +101,21 @@ public class Ng3CompareMain {
                 System.out.println("    points[2] = " + vec3Str(points.get(2)));
                 System.out.println("    points[1] = " + vec3Str(points.get(1)));
                 System.out.println("    points[3] = " + vec3Str(points.get(3)));
+            }
+        }
+        // Enfants (murs, etc.)
+        Method getChildren = foundationClass.getMethod("getChildren");
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> children = (java.util.List<Object>) getChildren.invoke(f);
+        if (children != null && !children.isEmpty()) {
+            Class<?> wallClass = loader.loadClass("org.concord.energy3d.model.Wall");
+            System.out.println("    children = " + children.size());
+            for (int i = 0; i < children.size(); i++) {
+                Object ch = children.get(i);
+                if (wallClass.isInstance(ch)) {
+                    System.out.println("      child[" + i + "] Wall:");
+                    dumpWall(ch, wallClass);
+                }
             }
         }
     }
@@ -129,8 +144,8 @@ public class Ng3CompareMain {
     }
 
     public static void main(String[] args) throws Exception {
-        String sh3dPath = args != null && args.length > 0 ? args[0] : "C:\\Users\\babas\\Documents\\test_sh3d.ng3";
-        String e3dPath  = args != null && args.length > 1 ? args[1] : "C:\\Users\\babas\\Documents\\test_e3d.ng3";
+        String sh3dPath = args != null && args.length > 0 ? args[0] : "C:\\Users\\babas\\Documents\\plan_energy3d.ng3";
+        String e3dPath  = args != null && args.length > 1 ? args[1] : "C:\\Users\\babas\\Documents\\plan_energy.ng3";
 
         File fSh3d = new File(sh3dPath);
         File fE3d  = new File(e3dPath);
