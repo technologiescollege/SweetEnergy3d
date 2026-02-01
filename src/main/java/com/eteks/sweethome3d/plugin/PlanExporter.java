@@ -243,6 +243,22 @@ public class PlanExporter {
             logWriter.println("INFO: Initialisation Scene ignorée (mode headless export)");
             logWriter.flush();
             
+            // Origine du plan : coin minimal des murs (axe SH3D), pour éviter la marge/boussole du plan
+            double originX = 0.0, originY = 0.0;
+            if (!sh3dWalls.isEmpty()) {
+                double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
+                for (Wall w : sh3dWalls) {
+                    minX = Math.min(minX, Math.min(w.getXStart(), w.getXEnd()));
+                    minY = Math.min(minY, Math.min(w.getYStart(), w.getYEnd()));
+                }
+                originX = minX;
+                originY = minY;
+                if (logWriter != null) {
+                    logWriter.println("Origine du plan (coin min murs): originX=" + originX + " cm, originY=" + originY + " cm");
+                    logWriter.flush();
+                }
+            }
+            
             // Créer la Foundation
             logWriter.println("Création de la Foundation...");
             logWriter.flush();
@@ -254,7 +270,7 @@ public class PlanExporter {
                 logWriter.flush();
                 foundation = createSizedFoundation(10.0, 10.0, logWriter);
             } else {
-                foundation = createFoundation(sh3dWalls, logWriter);
+                foundation = createFoundation(sh3dWalls, originX, originY, logWriter);
             }
             
             if (foundation == null) {
@@ -279,7 +295,7 @@ public class PlanExporter {
                         logWriter.println("  Conversion du mur " + wallIndex + "/" + sh3dWalls.size() + "...");
                         logWriter.flush();
                     }
-                    Object energy3dWall = convertWallToEnergy3D(sh3dWall, foundation, logWriter);
+                    Object energy3dWall = convertWallToEnergy3D(sh3dWall, foundation, originX, originY, logWriter);
                     if (energy3dWall != null) {
                         java.lang.reflect.Method getChildrenMethod = foundationClass.getMethod("getChildren");
                         @SuppressWarnings("unchecked")
@@ -1333,9 +1349,6 @@ public class PlanExporter {
     
     /** Comme plan_energy.ng3 (scale 0.2) : 1 m = 5 unités (fondation, hauteur mur). */
     private static final double ENERGY3D_UNITS_PER_METER = 5.0;
-    /** Longueur mur : 1 unité = 5 m affiché (référence plan_energy.ng3 a mur (0,0,1)→(1,0,1) = 5 m). */
-    private static final double WALL_LENGTH_UNITS_PER_METER = 0.2;
-    
     /**
      * Crée un mur posé sur l'origine (départ en (0,0), longueur le long de X).
      * @param lengthMeters longueur du mur en mètres (axe X)
@@ -1348,7 +1361,8 @@ public class PlanExporter {
     private static Object createWallAtOrigin(double lengthMeters, double heightMeters, double thicknessMeters,
             Object foundation, PrintWriter logWriter) {
         try {
-            double lengthUnits = lengthMeters * WALL_LENGTH_UNITS_PER_METER;
+            // Longueur le long de X : même échelle que convertWallToEnergy3D (WALL_LENGTH_SCALE_X_CM)
+            double lengthUnits = lengthMeters * 100.0 * WALL_LENGTH_SCALE_X_CM;
             double heightUnits = heightMeters * ENERGY3D_UNITS_PER_METER;
             double thicknessUnits = thicknessMeters * ENERGY3D_UNITS_PER_METER;
             // Mur le long de X : de (0,0,0) à (lengthUnits, 0, 0), hauteur heightUnits
@@ -1419,7 +1433,7 @@ public class PlanExporter {
         }
     }
     
-    private static Object createFoundation(Collection<Wall> sh3dWalls, PrintWriter logWriter) {
+    private static Object createFoundation(Collection<Wall> sh3dWalls, double originX, double originY, PrintWriter logWriter) {
         try {
             double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
             double maxX = Double.MIN_VALUE, maxY = Double.MIN_VALUE;
@@ -1447,6 +1461,11 @@ public class PlanExporter {
                 minY = cy - minSize * 0.5;
                 maxY = cy + minSize * 0.5;
             }
+            // Coordonnées fondation relatives à l'origine du plan (0,0 dans Energy3D = originX, originY en SH3D)
+            double relMinX = minX - originX;
+            double relMinY = minY - originY;
+            double relMaxX = maxX - originX;
+            double relMaxY = maxY - originY;
             
             // Précharger toutes les classes Ardor3D nécessaires AVANT de charger Foundation
             // HousePart a un champ statique offsetState = new OffsetState() qui doit être résolu
@@ -1600,10 +1619,15 @@ public class PlanExporter {
             }
             
             // Configurer la Foundation en définissant les 4 coins directement (comme Foundation(double, double)).
-            // Ne pas utiliser addPoint 4 fois : Foundation a 12 edit points, le 2e addPoint appelle complete() et le 3e lève "Drawing already completed".
+            // Coords relatives à l'origine du plan (0,0 dans Energy3D = coin min des murs en SH3D).
             try {
                 double scale = SCALE_CM_TO_ENERGY3D;
-                double x0 = minX * scale, y0 = minY * scale, x1 = maxX * scale, y1 = maxY * scale;
+                double x0 = relMinX * scale, y0 = relMinY * scale, x1 = relMaxX * scale, y1 = relMaxY * scale;
+                if (MIRROR_FLIP_X) {
+                    double tmp = x0;
+                    x0 = -x1;
+                    x1 = -tmp;
+                }
                 java.lang.reflect.Field pointsField = null;
                 for (Class<?> c = foundationClass; c != null; c = c.getSuperclass()) {
                     try {
@@ -1666,17 +1690,33 @@ public class PlanExporter {
     
     /** Comme plan_energy.ng3 (scale 0.2) : 100 cm = 5 unités, 1 m = 5 u (fondation, hauteur). */
     private static final double SCALE_CM_TO_ENERGY3D = 0.05;
-    /** Longueur mur (x,y) : 100 cm = 0,2 unité → 1 u = 5 m affiché (comme référence). */
-    private static final double WALL_LENGTH_SCALE_CM = 0.002;
+    /*
+     * Échelles mur X/Y (source Energy3D) :
+     * - Wall.getWallWidth() / getWallHeight() = distance(pts) * Scene.getScale() (Wall.java ~1855)
+     * - SizeAnnotation affiche : to.subtract(from).length() * Scene.getScale() (SizeAnnotation.java L103)
+     * - Convention : mètres_affichés = unités_modèle * annotationScale (Scene.annotationScale = 0.2, commenté "TODO: this is a mistake")
+     * Le code Energy3D n'applique pas d'échelle différente pour X et Y ; en pratique on observe 8m→17.6 sur X et 8m→14.4 sur Y,
+     * d'où les facteurs de correction empiriques ci‑dessous pour ramener à 1:1.
+     */
+    /** Échelle mur axe X : 8 m SH3D → 8 m Energy3D (correction 8/17.6 par rapport à 0.002). */
+    private static final double WALL_LENGTH_SCALE_X_CM = 0.002 * (8.0 / 17.6);
+    /** Échelle mur axe Y : 8 m SH3D → 8 m Energy3D (correction 8/14.4 par rapport à 0.002). */
+    private static final double WALL_LENGTH_SCALE_Y_CM = 0.002 * (8.0 / 14.4);
+    /** Inverser l'axe X pour corriger l'effet miroir entre vue intérieure et extérieure Energy3D. */
+    private static final boolean MIRROR_FLIP_X = true;
 
-    private static Object convertWallToEnergy3D(Wall sh3dWall, Object foundation, PrintWriter logWriter) {
+    private static Object convertWallToEnergy3D(Wall sh3dWall, Object foundation, double originX, double originY, PrintWriter logWriter) {
         try {
-            // Données dimensionnelles depuis Sweet Home 3D (x, y, longueur, épaisseur, hauteur)
+            // Données dimensionnelles depuis Sweet Home 3D ; positions relatives à l'origine du plan (échelles X/Y corrigées)
             WallConverter.Energy3DWallData data = WallConverter.convertToEnergy3D(sh3dWall);
-            double xStart = sh3dWall.getXStart() * WALL_LENGTH_SCALE_CM;
-            double yStart = sh3dWall.getYStart() * WALL_LENGTH_SCALE_CM;
-            double xEnd   = sh3dWall.getXEnd()   * WALL_LENGTH_SCALE_CM;
-            double yEnd   = sh3dWall.getYEnd()   * WALL_LENGTH_SCALE_CM;
+            double xStart = (sh3dWall.getXStart() - originX) * WALL_LENGTH_SCALE_X_CM;
+            double yStart = (sh3dWall.getYStart() - originY) * WALL_LENGTH_SCALE_Y_CM;
+            double xEnd   = (sh3dWall.getXEnd()   - originX) * WALL_LENGTH_SCALE_X_CM;
+            double yEnd   = (sh3dWall.getYEnd()   - originY) * WALL_LENGTH_SCALE_Y_CM;
+            if (MIRROR_FLIP_X) {
+                xStart = -xStart;
+                xEnd   = -xEnd;
+            }
             // Épaisseur mur : SH3D en cm ; défaut 0,2 m = 20 cm si non définie
             double thicknessCm = data.wallThickness > 0 ? data.wallThickness : 20.0;
             double thickness = thicknessCm * SCALE_CM_TO_ENERGY3D;
