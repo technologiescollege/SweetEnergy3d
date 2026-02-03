@@ -16,8 +16,7 @@ public class Energy3DExportPlugin extends Plugin {
     @Override
     public PluginAction[] getActions() {
         return new PluginAction[] {
-            new ExportAction(),
-            new ExportEmptyAction()
+            new ExportAction()
         };
     }
     
@@ -45,6 +44,18 @@ public class Energy3DExportPlugin extends Plugin {
                         "Veuillez ouvrir ou créer un plan avant d'exporter.",
                         "Aucun plan",
                         JOptionPane.WARNING_MESSAGE
+                    );
+                    return;
+                }
+                
+                // Vérifier que le niveau "terrain" existe et contient au moins des murs ou une pièce
+                String validationError = PlanExporter.getExportValidationError(home);
+                if (validationError != null) {
+                    JOptionPane.showMessageDialog(
+                        null,
+                        validationError,
+                        "Export impossible",
+                        JOptionPane.INFORMATION_MESSAGE
                     );
                     return;
                 }
@@ -162,6 +173,17 @@ public class Energy3DExportPlugin extends Plugin {
                             JOptionPane.INFORMATION_MESSAGE
                         );
                     } else {
+                        // Réafficher le message de validation si l'export a échoué pour cause de terrain
+                        String validationMsg = PlanExporter.getExportValidationError(home);
+                        if (validationMsg != null) {
+                            JOptionPane.showMessageDialog(
+                                null,
+                                validationMsg,
+                                "Export impossible",
+                                JOptionPane.INFORMATION_MESSAGE
+                            );
+                            return;
+                        }
                         String errorMessage = "Erreur lors de l'export du plan.\n\n";
                         
                         // Vérifier si le fichier existe
@@ -198,79 +220,6 @@ public class Energy3DExportPlugin extends Plugin {
                 JOptionPane.showMessageDialog(
                     null,
                     "Erreur lors de l'export:\n" + e.getMessage(),
-                    "Erreur",
-                    JOptionPane.ERROR_MESSAGE
-                );
-                e.printStackTrace();
-            }
-        }
-    }
-    
-    /**
-     * Action pour exporter un fichier .ng3 vide
-     */
-    private class ExportEmptyAction extends PluginAction {
-        
-        public ExportEmptyAction() {
-            super("com.eteks.sweethome3d.plugin.Energy3DExportPlugin",
-                  "EXPORT_EMPTY_ACTION",
-                  getPluginClassLoader(),
-                  true);
-        }
-        
-        @Override
-        public void execute() {
-            try {
-                JFileChooser fileChooser = new JFileChooser();
-                fileChooser.setDialogTitle("Créer un projet Energy3D vide");
-                fileChooser.setFileFilter(new FileNameExtensionFilter(
-                    "Fichiers Energy3D (*.ng3)", "ng3"));
-                fileChooser.setSelectedFile(new File("projet_vide.ng3"));
-                
-                int result = fileChooser.showSaveDialog(null);
-                if (result == JFileChooser.APPROVE_OPTION) {
-                    File outputFile = fileChooser.getSelectedFile();
-                    if (!outputFile.getName().toLowerCase().endsWith(".ng3")) {
-                        outputFile = new File(outputFile.getParent(), outputFile.getName() + ".ng3");
-                    }
-                    if (outputFile.exists()) {
-                        int overwrite = JOptionPane.showConfirmDialog(
-                            null,
-                            "Le fichier existe déjà :\n" + outputFile.getName() + "\n\nVoulez-vous l'écraser ?",
-                            "Fichier existant",
-                            JOptionPane.YES_NO_OPTION,
-                            JOptionPane.QUESTION_MESSAGE
-                        );
-                        if (overwrite != JOptionPane.YES_OPTION) {
-                            return;
-                        }
-                    }
-                    // Créer un .ng3 avec une fondation 5m x 5m (createSizedFoundation convertit m → unités Energy3D)
-                    boolean success = PlanExporter.exportEmptyNg3WithFloor(5.0, 5.0, outputFile);
-                    if (success) {
-                        JOptionPane.showMessageDialog(
-                            null,
-                            String.format(
-                                "Projet Energy3D créé avec une fondation 5 m × 5 m et un mur 5 m × 2 m à l'origine.\n\nFichier: %s\nTaille: %d bytes\n\nOuvrez ce fichier dans Energy3D pour voir la fondation et le mur.",
-                                outputFile.getAbsolutePath(),
-                                outputFile.length()
-                            ),
-                            "Création réussie",
-                            JOptionPane.INFORMATION_MESSAGE
-                        );
-                    } else {
-                        JOptionPane.showMessageDialog(
-                            null,
-                            "Erreur lors de la création du fichier .ng3.\n\nVeuillez consulter le fichier .log généré.",
-                            "Erreur",
-                            JOptionPane.ERROR_MESSAGE
-                        );
-                    }
-                }
-            } catch (Exception e) {
-                JOptionPane.showMessageDialog(
-                    null,
-                    "Erreur lors de la création:\n" + e.getMessage(),
                     "Erreur",
                     JOptionPane.ERROR_MESSAGE
                 );

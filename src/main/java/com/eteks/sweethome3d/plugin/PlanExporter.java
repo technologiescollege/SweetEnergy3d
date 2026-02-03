@@ -1,13 +1,23 @@
 package com.eteks.sweethome3d.plugin;
 
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
 import java.io.PrintWriter;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
 
 import com.eteks.sweethome3d.model.Home;
+import com.eteks.sweethome3d.model.HomeDoorOrWindow;
+import com.eteks.sweethome3d.model.HomeFurnitureGroup;
+import com.eteks.sweethome3d.model.HomePieceOfFurniture;
+import com.eteks.sweethome3d.model.Level;
+import com.eteks.sweethome3d.model.Room;
 import com.eteks.sweethome3d.model.Wall;
 
 // Energy3D imports - chargement dynamique pour éviter les erreurs de compilation
@@ -21,6 +31,24 @@ import com.eteks.sweethome3d.model.Wall;
  * Classe utilitaire pour exporter un plan Sweet Home 3D vers un fichier .ng3 binaire Energy3D
  */
 public class PlanExporter {
+    
+    /**
+     * Vérifie si le plan peut être exporté vers Energy3D (niveau "terrain" présent avec au moins une pièce).
+     * 
+     * @param home Le Home à vérifier
+     * @return null si l'export est possible, sinon le message d'erreur à afficher (pas d'export)
+     */
+    public static String getExportValidationError(Home home) {
+        if (home == null) return "Aucun plan ouvert.";
+        Level terrainLevel = findLevelTerrainOrEquivalent(home, null);
+        if (terrainLevel == null) {
+            return "Aucun terrain dans ce plan. Créez un niveau nommé \"terrain\" avec au moins une pièce pour pouvoir exporter vers Energy3D.";
+        }
+        if (findRoomOnLevel(home, terrainLevel, null) == null) {
+            return "Le niveau \"terrain\" existe mais il n'y a pas de pièce dessus. Ajoutez au moins une pièce sur ce niveau pour pouvoir exporter vers Energy3D.";
+        }
+        return null;
+    }
     
     /**
      * Exporte un plan complet vers un fichier .ng3 binaire compatible Energy3D
@@ -54,6 +82,16 @@ public class PlanExporter {
                 System.err.println("ERREUR lors de la création du log: " + e.getMessage());
                 e.printStackTrace();
                 // Continuer sans log
+            }
+            
+            // Vérifier que le niveau "terrain" existe et contient au moins des murs ou une pièce (pas de fondation 10x10 par défaut)
+            String validationError = getExportValidationError(home);
+            if (validationError != null) {
+                if (logWriter != null) {
+                    logWriter.println("Export impossible: " + validationError.replace("\n\n", " "));
+                    logWriter.flush();
+                }
+                return false;
             }
             
             // Vérifier les classes Energy3D
@@ -243,60 +281,72 @@ public class PlanExporter {
             logWriter.println("INFO: Initialisation Scene ignorée (mode headless export)");
             logWriter.flush();
             
-            // Origine du plan : coin minimal des murs (axe SH3D), pour éviter la marge/boussole du plan
+            // Fondation = pièce sur le niveau "terrain" (déjà validé : terrain + au moins une pièce)
             double originX = 0.0, originY = 0.0;
-            if (!sh3dWalls.isEmpty()) {
-                double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE;
-                for (Wall w : sh3dWalls) {
-                    minX = Math.min(minX, Math.min(w.getXStart(), w.getXEnd()));
-                    minY = Math.min(minY, Math.min(w.getYStart(), w.getYEnd()));
-                }
-                originX = minX;
-                originY = minY;
-                if (logWriter != null) {
-                    logWriter.println("Origine du plan (coin min murs): originX=" + originX + " cm, originY=" + originY + " cm");
-                    logWriter.flush();
-                }
-            }
-            
-            // Créer la Foundation
-            logWriter.println("Création de la Foundation...");
-            logWriter.flush();
-            
-            Object foundation = null;
-            if (sh3dWalls.isEmpty()) {
-                // Créer une foundation par défaut 10x10 m via Foundation(largeur, longueur) en unités (évite addPoint qui lève "Drawing already completed")
-                logWriter.println("Aucun mur trouvé, création d'une foundation par défaut (10x10 m)...");
-                logWriter.flush();
-                foundation = createSizedFoundation(10.0, 10.0, logWriter);
-            } else {
-                foundation = createFoundation(sh3dWalls, originX, originY, logWriter);
-            }
-            
-            if (foundation == null) {
-                logWriter.println("✗ ERREUR: Impossible de créer la Foundation");
+            Level terrainLevel = findLevelTerrainOrEquivalent(home, logWriter);
+            Room terrainRoom = findRoomOnLevel(home, terrainLevel, logWriter);
+            if (terrainRoom == null) {
+                logWriter.println("✗ ERREUR: Aucune pièce sur le niveau 'terrain' (validation incohérente)");
                 logWriter.flush();
                 return false;
             }
-            
-            logWriter.println("✓ Foundation créée");
+            float[][] rpts = terrainRoom.getPoints();
+            if (rpts != null && rpts.length >= 2) {
+                double rminX = Double.MAX_VALUE, rminY = Double.MAX_VALUE, rmaxX = Double.MIN_VALUE, rmaxY = Double.MIN_VALUE;
+                for (int i = 0; i < rpts.length; i++) {
+                    rminX = Math.min(rminX, rpts[i][0]);
+                    rminY = Math.min(rminY, rpts[i][1]);
+                    rmaxX = Math.max(rmaxX, rpts[i][0]);
+                    rmaxY = Math.max(rmaxY, rpts[i][1]);
+                }
+                originX = 0.5 * (rminX + rmaxX);
+                originY = 0.5 * (rminY + rmaxY);
+            }
+            if (logWriter != null) {
+                logWriter.println("Origine = centre pièce terrain: " + originX + ", " + originY + " cm");
+                logWriter.flush();
+            }
+            Object foundation = createFoundationFromRoom(terrainRoom, foundationClass, originX, originY, logWriter);
+            if (foundation == null) {
+                logWriter.println("✗ ERREUR: Impossible de créer la fondation à partir de la pièce terrain");
+                logWriter.flush();
+                return false;
+            }
+            Class<?> housePartClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.HousePart", logWriter);
+            java.lang.reflect.Method addMethod = sceneClass.getMethod("add", housePartClass, boolean.class);
+            logWriter.println("✓ Fondation créée");
             logWriter.flush();
             
-            // Convertir les murs
-            logWriter.println("Conversion des murs...");
+            logWriter.println("Conversion des murs SH3D → Energy3D (tous les niveaux)...");
             logWriter.flush();
-            
+            List<HomePieceOfFurniture> allFurniture = getAllFurnitureIncludingGroups(home);
+            int doorsWindowsCount = 0;
+            for (HomePieceOfFurniture p : allFurniture) {
+                if (p.isDoorOrWindow() && p instanceof HomeDoorOrWindow) doorsWindowsCount++;
+            }
+            if (logWriter != null) {
+                logWriter.println("  Portes/fenêtres dans le plan (tous niveaux, dont groupes): " + doorsWindowsCount);
+                logWriter.flush();
+            }
+            // Parcourir les murs dans le sens attendu par Energy3D (connectWalls / périmètre fondation)
+            List<Wall> wallsToProcess = new ArrayList<>(sh3dWalls);
+            if (WALLS_TRAVERSE_REVERSE_ORDER) {
+                Collections.reverse(wallsToProcess);
+                if (logWriter != null) logWriter.println("  Ordre des murs: inversé (sens périmètre Energy3D)");
+            }
             int wallCount = 0;
             int wallIndex = 0;
-            for (Wall sh3dWall : sh3dWalls) {
+            for (Wall sh3dWall : wallsToProcess) {
                 wallIndex++;
                 try {
                     if (logWriter != null) {
-                        logWriter.println("  Conversion du mur " + wallIndex + "/" + sh3dWalls.size() + "...");
+                        logWriter.println("  Mur " + wallIndex + "/" + sh3dWalls.size() + "...");
                         logWriter.flush();
                     }
                     Object energy3dWall = convertWallToEnergy3D(sh3dWall, foundation, originX, originY, logWriter);
                     if (energy3dWall != null) {
+                        // Convertir les fenêtres/portes SH3D sur ce mur en Window Energy3D (avant d'ajouter le mur à la fondation ; tous niveaux)
+                        convertWindowsOnWall(home, sh3dWall, energy3dWall, foundation, originX, originY, foundationClass, logWriter);
                         java.lang.reflect.Method getChildrenMethod = foundationClass.getMethod("getChildren");
                         @SuppressWarnings("unchecked")
                         java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(foundation);
@@ -305,53 +355,30 @@ public class PlanExporter {
                         if (logWriter != null) { logWriter.println("  ✓ Mur " + wallIndex + " converti"); logWriter.flush(); }
                     }
                 } catch (Throwable t) {
-                    logWriter.println("  ✗ ERREUR lors de la conversion du mur " + wallIndex + ": " + t.getClass().getName() + " - " + t.getMessage());
+                    logWriter.println("  ✗ ERREUR mur " + wallIndex + ": " + t.getMessage());
                     t.printStackTrace(logWriter);
                     logWriter.flush();
                 }
             }
-            // Si fichier vide (aucun mur), ajouter un mur par défaut 5 m × 2 m × 0,2 m
-            if (sh3dWalls.isEmpty()) {
-                if (logWriter != null) {
-                    logWriter.println("  Ajout d'un mur par défaut (5 m × 2 m × 0,2 m)...");
-                    logWriter.flush();
-                }
-                Object defaultWall = createWallAtOrigin(5.0, 2.0, 0.2, foundation, logWriter);
-                if (defaultWall != null) {
-                    java.lang.reflect.Method getChildrenMethod = foundationClass.getMethod("getChildren");
-                    @SuppressWarnings("unchecked")
-                    java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(foundation);
-                    children.add(defaultWall);
-                    wallCount = 1;
-                    if (logWriter != null) { logWriter.println("  ✓ Mur par défaut ajouté"); logWriter.flush(); }
-                } else if (logWriter != null) {
-                    logWriter.println("  ⚠ Impossible de créer le mur par défaut"); logWriter.flush();
-                }
-            }
-            
             logWriter.println("✓ " + wallCount + " murs convertis");
             logWriter.flush();
-            
-            // Dessiner la foundation
             try {
-                java.lang.reflect.Method drawMethod = foundationClass.getMethod("draw");
-                drawMethod.invoke(foundation);
+                foundationClass.getMethod("connectWalls").invoke(foundation);
+            } catch (Exception ignored) { }
+
+            try {
+                foundationClass.getMethod("draw").invoke(foundation);
             } catch (Exception e) {
-                logWriter.println("AVERTISSEMENT lors du dessin: " + e.getMessage());
+                logWriter.println("AVERTISSEMENT dessin fondation: " + e.getMessage());
             }
             
-            // Ajouter la foundation à la Scene (comme Energy3D le fait)
-            logWriter.println("Ajout de la Foundation à la Scene...");
+            logWriter.println("Ajout de la fondation à la Scene...");
+            logWriter.flush();
+            addMethod.invoke(scene, foundation, true);
+            logWriter.println("✓ Fondation ajoutée à la Scene");
             logWriter.flush();
             
-            Class<?> housePartClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.HousePart", logWriter);
-            java.lang.reflect.Method addMethod = sceneClass.getMethod("add", housePartClass, boolean.class);
-            addMethod.invoke(scene, foundation, false);
-            
-            logWriter.println("✓ Foundation ajoutée à la Scene");
-            logWriter.flush();
-            
-            ensureSceneAnnotationScale(sceneClass, scene, 0.2, logWriter);
+            ensureSceneAnnotationScale(sceneClass, scene, ENERGY3D_DEFAULT_SCALE, logWriter);
             
             // Caméra (comme plan_energy.ng3) : définie juste avant sérialisation pour être bien persistée
             setExportedSceneCamera(sceneClass, scene, logWriter, 14.69, -139.37, 41.82);
@@ -592,25 +619,28 @@ public class PlanExporter {
                 return exportEmptyNg3(outputFile);
             }
             
-            // Mur 5m (longueur) x 2m (hauteur), même échelle 0.2 que l'export plan (zoom et pas cohérents)
-            Object wall = createWallAtOrigin(5.0, 2.0, 0.2, foundation, logWriter);
-            if (wall != null) {
-                try {
-                    java.lang.reflect.Method getChildrenMethod = foundation.getClass().getMethod("getChildren");
-                    @SuppressWarnings("unchecked")
-                    java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(foundation);
-                    children.add(wall);
-                    if (logWriter != null) {
-                        logWriter.println("✓ Mur 5m x 2m ajouté à la fondation (origine)");
-                        logWriter.flush();
-                    }
-                } catch (Exception e) {
-                    if (logWriter != null) {
-                        logWriter.println("⚠ Mur non ajouté aux enfants: " + e.getMessage());
-                        logWriter.flush();
-                    }
-                }
-            }
+            // Mur 5m x 2m : désactivé pour vérifier la fondation seule
+            // Object wall = createWallAtOrigin(5.0, 2.0, 0.2, foundation, logWriter);
+            // if (wall != null) {
+            //     try {
+            //         java.lang.reflect.Method getChildrenMethod = foundation.getClass().getMethod("getChildren");
+            //         @SuppressWarnings("unchecked")
+            //         java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(foundation);
+            //         children.add(wall);
+            //         try {
+            //             foundation.getClass().getMethod("connectWalls").invoke(foundation);
+            //         } catch (Exception ignored) { }
+            //         if (logWriter != null) {
+            //             logWriter.println("✓ Mur 5m x 2m ajouté à la fondation (origine)");
+            //             logWriter.flush();
+            //         }
+            //     } catch (Exception e) {
+            //         if (logWriter != null) {
+            //             logWriter.println("⚠ Mur non ajouté aux enfants: " + e.getMessage());
+            //             logWriter.flush();
+            //         }
+            //     }
+            // }
             
             try {
                 Class<?> housePartClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.HousePart", logWriter);
@@ -637,7 +667,7 @@ public class PlanExporter {
             
             // Caméra pour fondation 10×10 m (50×50 unités scale 0.2)
             setExportedSceneCamera(sceneClass, scene, logWriter, 0, -40, 10);
-            ensureSceneAnnotationScale(sceneClass, scene, 0.2, logWriter);
+            ensureSceneAnnotationScale(sceneClass, scene, ENERGY3D_DEFAULT_SCALE, logWriter);
             setSceneCameraFieldsByReflection(sceneClass, scene, 0, -40, 10, logWriter);
             
             boolean ok = serializeSceneToNG3(scene, outputFile, logWriter);
@@ -769,7 +799,7 @@ public class PlanExporter {
             }
             ensureSceneInstance(sceneClass, scene, logWriter);
             // Scène de départ Energy3D : annotationScale 0.2 (défaut Scene), Human + Foundation(80,60)
-            ensureSceneAnnotationScale(sceneClass, scene, 0.2, logWriter);
+            ensureSceneAnnotationScale(sceneClass, scene, ENERGY3D_DEFAULT_SCALE, logWriter);
             populateSceneAsEnergy3DDefault(sceneClass, scene, logWriter);
             // Caméra pour 16 m x 12 m (scale 0.2) : camY=-40, camZ=10 unités ≈ 8 m derrière, 2 m hauteur
             setExportedSceneCamera(sceneClass, scene, logWriter, -40, 10);
@@ -860,13 +890,13 @@ public class PlanExporter {
                 logWriter.println("INFO: Scene.instance déjà défini: " + existing.getClass().getName());
                 logWriter.flush();
             }
-            // Aligner sur plan_energy.ng3 (Energy3D) : annotationScale 0.2, 1 m = 5 unités (grille 1 m)
+            // Grille 1×1×0,2 m : garder annotationScale = 0,2 (défaut Energy3D)
             try {
                 java.lang.reflect.Field scaleField = sceneClass.getDeclaredField("annotationScale");
                 scaleField.setAccessible(true);
-                scaleField.set(sceneInstance, 0.2);
+                scaleField.set(sceneInstance, ENERGY3D_DEFAULT_SCALE);
                 if (logWriter != null) {
-                    logWriter.println("✓ Scene.annotationScale = 0.2 (comme Energy3D, 1 m = 5 unités)");
+                    logWriter.println("✓ Scene.annotationScale = " + ENERGY3D_DEFAULT_SCALE + " (grille 1×1×0,2 m)");
                     logWriter.flush();
                 }
             } catch (Exception e) {
@@ -1298,15 +1328,13 @@ public class PlanExporter {
             try {
                 java.lang.reflect.Constructor<?> ctor = foundationClass.getConstructor(double.class, double.class);
                 Object foundation = ctor.newInstance(widthUnits, heightUnits);
-                // Épaisseur fondation 0,2 m = 1 unité (scale 0.2, comme référence)
-                final double DEFAULT_FOUNDATION_THICKNESS_M = 0.2;
-                double foundationHeightUnits = DEFAULT_FOUNDATION_THICKNESS_M * UNITS_PER_M;
+                // Épaisseur fondation : 1 unité = 0,2 m affiché (scale 0,2)
                 try {
                     java.lang.reflect.Field heightField = foundationClass.getSuperclass().getDeclaredField("height");
                     heightField.setAccessible(true);
-                    heightField.setDouble(foundation, foundationHeightUnits);
+                    heightField.setDouble(foundation, FOUNDATION_HEIGHT_UNITS);
                     if (logWriter != null) {
-                        logWriter.println("  Foundation.height = " + DEFAULT_FOUNDATION_THICKNESS_M + " m (épaisseur par défaut)");
+                        logWriter.println("  Foundation.height = " + FOUNDATION_HEIGHT_UNITS + " u (0,2 m affiché)");
                         logWriter.flush();
                     }
                 } catch (Exception e) {
@@ -1315,6 +1343,7 @@ public class PlanExporter {
                         logWriter.flush();
                     }
                 }
+                setFoundationChildGridSize(foundationClass, foundation, 5.0, logWriter);
                 if (logWriter != null) {
                     logWriter.println("✓ Foundation créée via constructeur: " + widthMeters + "m x " + heightMeters + "m → " + widthUnits + " x " + heightUnits + " unités");
                     logWriter.flush();
@@ -1335,6 +1364,7 @@ public class PlanExporter {
                 addPointMethod.invoke(foundation, -halfWidthCm, halfHeightCm);
                 java.lang.reflect.Method completeMethod = foundationClass.getMethod("complete");
                 completeMethod.invoke(foundation);
+                setFoundationChildGridSize(foundationClass, foundation, 5.0, logWriter);
                 return foundation;
             }
         } catch (Throwable e) {
@@ -1347,46 +1377,44 @@ public class PlanExporter {
         }
     }
     
-    /** Comme plan_energy.ng3 (scale 0.2) : 1 m = 5 unités (fondation, hauteur mur). */
-    private static final double ENERGY3D_UNITS_PER_METER = 5.0;
     /**
-     * Crée un mur posé sur l'origine (départ en (0,0), longueur le long de X).
-     * @param lengthMeters longueur du mur en mètres (axe X)
-     * @param heightMeters hauteur du mur en mètres (axe Z)
-     * @param thicknessMeters épaisseur du mur en mètres
-     * @param foundation fondation Energy3D (conteneur du mur)
-     * @param logWriter log (peut être null)
-     * @return le Wall Energy3D ou null en cas d'erreur
+     * Crée un mur Energy3D sur la fondation (centre → +X sur lengthMeters).
+     * Les points du mur sont en (u, v, z) relatifs à la fondation (HousePart.toAbsolute) :
+     * u,v = facteurs 0-1 sur les arêtes (0.5,0.5 = centre) ; z = altitude absolue.
+     * Base du mur à container.height, sommet à container.height + heightMeters.
      */
     private static Object createWallAtOrigin(double lengthMeters, double heightMeters, double thicknessMeters,
             Object foundation, PrintWriter logWriter) {
         try {
-            // Longueur le long de X : même échelle que convertWallToEnergy3D (WALL_LENGTH_SCALE_X_CM)
-            double lengthUnits = lengthMeters * 100.0 * WALL_LENGTH_SCALE_X_CM;
-            double heightUnits = heightMeters * ENERGY3D_UNITS_PER_METER;
-            double thicknessUnits = thicknessMeters * ENERGY3D_UNITS_PER_METER;
-            // Mur le long de X : de (0,0,0) à (lengthUnits, 0, 0), hauteur heightUnits
-            double xStart = 0, yStart = 0, xEnd = lengthUnits, yEnd = 0;
-            
+            Class<?> foundationClass = foundation.getClass();
             Class<?> wallClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Wall", logWriter);
-            if (logWriter != null) { logWriter.println("  Création mur à l'origine " + lengthMeters + "m x " + heightMeters + "m..."); logWriter.flush(); }
-            Object wall = wallClass.newInstance();
-            // setContainer(HousePart): use HousePart from same ClassLoader as Wall to avoid NoSuchMethodError
             Class<?> housePartClass = wallClass.getClassLoader().loadClass("org.concord.energy3d.model.HousePart");
+            java.lang.reflect.Method getAbsPoint = foundationClass.getMethod("getAbsPoint", int.class);
+            java.lang.reflect.Method getHeightMethod = foundationClass.getMethod("getHeight");
+            Object p0 = getAbsPoint.invoke(foundation, 0);
+            Object p2 = getAbsPoint.invoke(foundation, 2);
+            double dx = ((Number) p2.getClass().getMethod("getX").invoke(p2)).doubleValue() - ((Number) p0.getClass().getMethod("getX").invoke(p0)).doubleValue();
+            double dy = ((Number) p2.getClass().getMethod("getY").invoke(p2)).doubleValue() - ((Number) p0.getClass().getMethod("getY").invoke(p0)).doubleValue();
+            double foundationWidthM = Math.sqrt(dx * dx + dy * dy);
+            if (foundationWidthM <= 0) foundationWidthM = 1.0;
+
+            // Hauteur du sol de la fondation : les murs sont posés sur container.height (HousePart.toAbsolute utilise p.getZ() comme Z absolue).
+            double foundationHeight = ((Number) getHeightMethod.invoke(foundation)).doubleValue();
+
+            // (u, v, z) : u = facteur 0-1 le long de l'arête 0-2, v = facteur 0-1 le long de 0-1. Centre = (0.5, 0.5). Z = altitude absolue.
+            double uStart = 0.5;
+            double vStart = 0.5;
+            double uEnd = 0.5 + lengthMeters / foundationWidthM;
+            double vEnd = 0.5;
+            double zBottom = foundationHeight;
+            double zTop = foundationHeight + heightMeters;
+
+            Object wall = wallClass.getDeclaredConstructor().newInstance();
             java.lang.reflect.Method setContainerMethod = wallClass.getMethod("setContainer", housePartClass);
             setContainerMethod.invoke(wall, foundation);
             java.lang.reflect.Method setThicknessMethod = wallClass.getMethod("setThickness", double.class);
-            setThicknessMethod.invoke(wall, thicknessUnits);
+            setThicknessMethod.invoke(wall, thicknessMeters);
 
-            // Wall.setHeight() uses points.get(1) and points.get(3) -> fill points BEFORE setHeight
-            ClassLoader loader = foundation.getClass().getClassLoader();
-            Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
-            java.lang.reflect.Method vector3Set = vector3Class.getMethod("set", double.class, double.class, double.class);
-            double baseZ = 0.0;
-            try {
-                java.lang.reflect.Method getHeightMethod = foundation.getClass().getMethod("getHeight");
-                baseZ = ((Number) getHeightMethod.invoke(foundation)).doubleValue();
-            } catch (Exception ignored) { }
             java.lang.reflect.Field pointsField = null;
             for (Class<?> c = wallClass; c != null; c = c.getSuperclass()) {
                 try {
@@ -1398,15 +1426,18 @@ public class PlanExporter {
             pointsField.setAccessible(true);
             @SuppressWarnings("unchecked")
             java.util.List<Object> pointsList = (java.util.List<Object>) pointsField.get(wall);
+            ClassLoader loader = foundationClass.getClassLoader();
+            Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
+            java.lang.reflect.Method vector3Set = vector3Class.getMethod("set", double.class, double.class, double.class);
             while (pointsList.size() < 4) {
-                Object v = vector3Class.getConstructor(double.class, double.class, double.class)
-                    .newInstance(0.0, 0.0, 0.0);
-                pointsList.add(v);
+                pointsList.add(vector3Class.getConstructor(double.class, double.class, double.class).newInstance(0.0, 0.0, 0.0));
             }
-            vector3Set.invoke(pointsList.get(0), xStart, yStart, baseZ);
-            vector3Set.invoke(pointsList.get(1), xStart, yStart, baseZ + heightUnits);
-            vector3Set.invoke(pointsList.get(2), xEnd,   yEnd,   baseZ);
-            vector3Set.invoke(pointsList.get(3), xEnd,   yEnd,   baseZ + heightUnits);
+            // 0=start bas, 1=start haut, 2=end bas, 3=end haut (coords u,v,z : u,v facteurs sur fondation, z altitude absolue)
+            vector3Set.invoke(pointsList.get(0), uStart, vStart, zBottom);
+            vector3Set.invoke(pointsList.get(1), uStart, vStart, zTop);
+            vector3Set.invoke(pointsList.get(2), uEnd,   vEnd,   zBottom);
+            vector3Set.invoke(pointsList.get(3), uEnd,   vEnd,   zTop);
+
             try {
                 java.lang.reflect.Field firstPointField = wallClass.getSuperclass().getDeclaredField("firstPointInserted");
                 firstPointField.setAccessible(true);
@@ -1414,18 +1445,20 @@ public class PlanExporter {
             } catch (Exception ignored) { }
 
             java.lang.reflect.Method setHeightMethod = wallClass.getMethod("setHeight", double.class, boolean.class);
-            setHeightMethod.invoke(wall, heightUnits, true);
+            setHeightMethod.invoke(wall, heightMeters, true);
 
             java.lang.reflect.Method completeMethod = wallClass.getMethod("complete");
             completeMethod.invoke(wall);
             java.lang.reflect.Method drawMethod = wallClass.getMethod("draw");
             drawMethod.invoke(wall);
-            
+            if (logWriter != null) {
+                logWriter.println("  Mur créé: u " + uStart + "→" + uEnd + ", v=" + vStart + ", z=" + zBottom + "→" + zTop + " m, fondation largeur " + foundationWidthM + " m");
+                logWriter.flush();
+            }
             return wall;
         } catch (Throwable t) {
             if (logWriter != null) {
-                String msg = t.getMessage();
-                logWriter.println("  ✗ Erreur createWallAtOrigin: " + (msg != null ? msg : t.getClass().getName()));
+                logWriter.println("  ✗ Erreur createWallAtOrigin: " + (t.getMessage() != null ? t.getMessage() : t.getClass().getName()));
                 t.printStackTrace(new java.io.PrintWriter(logWriter, true));
                 logWriter.flush();
             }
@@ -1565,14 +1598,50 @@ public class PlanExporter {
             // Charger la classe Foundation dynamiquement via le ClassLoader Energy3D
             Class<?> foundationClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Foundation", logWriter);
             
-            if (logWriter != null) {
-                logWriter.println("  Tentative d'instanciation de Foundation...");
-                logWriter.println("  ClassLoader utilisé: " + foundationClass.getClassLoader().getClass().getName());
-                logWriter.flush();
+            double scale = SCALE_CM_TO_ENERGY3D;
+            double x0 = relMinX * scale, y0 = relMinY * scale, x1 = relMaxX * scale, y1 = relMaxY * scale;
+            if (MIRROR_FLIP_X) {
+                double tmp = x0;
+                x0 = -x1;
+                x1 = -tmp;
             }
-            System.out.println("DEBUG: Tentative d'instanciation de Foundation...");
+            if (ROTATE_180_Z) {
+                double tmpY0 = y0;
+                y0 = -y1;
+                y1 = -tmpY0;
+            }
+            double widthUnits = x1 - x0;
+            double heightUnits = y1 - y0;
+            double centerX = 0.5 * (x0 + x1);
+            double centerY = 0.5 * (y0 + y1);
             
+            // Comme "projet vide" : Foundation(double, double) évite CullHint.Always (constructeur sans arg = invisible).
             Object foundation = null;
+            try {
+                java.lang.reflect.Constructor<?> ctor = foundationClass.getConstructor(double.class, double.class);
+                foundation = ctor.newInstance(widthUnits, heightUnits);
+                Object root = foundationClass.getMethod("getRoot").invoke(foundation);
+                if (root != null) {
+                    root.getClass().getMethod("setTranslation", double.class, double.class, double.class).invoke(root, centerX, centerY, 0.0);
+                }
+                foundationClass.getMethod("draw").invoke(foundation);
+                if (logWriter != null) {
+                    logWriter.println("  ✓ Foundation créée via Foundation(largeur, hauteur) + translation (visible, comme projet vide)");
+                    logWriter.flush();
+                }
+                return foundation;
+            } catch (NoSuchMethodException nsme) {
+                if (logWriter != null) {
+                    logWriter.println("  Constructeur Foundation(double,double) introuvable, bascule vers newInstance + points + complete");
+                    logWriter.flush();
+                }
+            } catch (Throwable e) {
+                if (logWriter != null) {
+                    logWriter.println("  ⚠ Foundation(double,double) échoué: " + e.getMessage() + ", bascule vers newInstance");
+                    logWriter.flush();
+                }
+            }
+            
             try {
                 foundation = foundationClass.newInstance();
                 if (logWriter != null) {
@@ -1621,13 +1690,6 @@ public class PlanExporter {
             // Configurer la Foundation en définissant les 4 coins directement (comme Foundation(double, double)).
             // Coords relatives à l'origine du plan (0,0 dans Energy3D = coin min des murs en SH3D).
             try {
-                double scale = SCALE_CM_TO_ENERGY3D;
-                double x0 = relMinX * scale, y0 = relMinY * scale, x1 = relMaxX * scale, y1 = relMaxY * scale;
-                if (MIRROR_FLIP_X) {
-                    double tmp = x0;
-                    x0 = -x1;
-                    x1 = -tmp;
-                }
                 java.lang.reflect.Field pointsField = null;
                 for (Class<?> c = foundationClass; c != null; c = c.getSuperclass()) {
                     try {
@@ -1688,58 +1750,705 @@ public class PlanExporter {
         }
     }
     
-    /** Comme plan_energy.ng3 (scale 0.2) : 100 cm = 5 unités, 1 m = 5 u (fondation, hauteur). */
-    private static final double SCALE_CM_TO_ENERGY3D = 0.05;
-    /*
-     * Échelles mur X/Y (source Energy3D) :
-     * - Wall.getWallWidth() / getWallHeight() = distance(pts) * Scene.getScale() (Wall.java ~1855)
-     * - SizeAnnotation affiche : to.subtract(from).length() * Scene.getScale() (SizeAnnotation.java L103)
-     * - Convention : mètres_affichés = unités_modèle * annotationScale (Scene.annotationScale = 0.2, commenté "TODO: this is a mistake")
-     * Le code Energy3D n'applique pas d'échelle différente pour X et Y ; en pratique on observe 8m→17.6 sur X et 8m→14.4 sur Y,
-     * d'où les facteurs de correction empiriques ci‑dessous pour ramener à 1:1.
+    /** Noms acceptés pour le niveau SH3D utilisé comme fondation (terrain / ground). */
+    private static final String[] TERRAIN_LEVEL_NAMES = { "terrain", "Terrain", "fondation", "foundation", "ground" };
+    
+    /**
+     * Retourne le niveau (plan) SH3D dont le nom correspond à l'un des noms acceptés (terrain, Terrain, fondation, foundation, ground).
+     * Comparaison insensible à la casse après trim.
      */
-    /** Échelle mur axe X : 8 m SH3D → 8 m Energy3D (correction 8/17.6 par rapport à 0.002). */
-    private static final double WALL_LENGTH_SCALE_X_CM = 0.002 * (8.0 / 17.6);
-    /** Échelle mur axe Y : 8 m SH3D → 8 m Energy3D (correction 8/14.4 par rapport à 0.002). */
-    private static final double WALL_LENGTH_SCALE_Y_CM = 0.002 * (8.0 / 14.4);
-    /** Inverser l'axe X pour corriger l'effet miroir entre vue intérieure et extérieure Energy3D. */
-    private static final boolean MIRROR_FLIP_X = true;
+    private static Level findLevelTerrainOrEquivalent(Home home, PrintWriter logWriter) {
+        if (home == null) return null;
+        java.util.List<Level> levels = home.getLevels();
+        if (levels == null || levels.isEmpty()) {
+            if (logWriter != null) {
+                logWriter.println("  Aucun niveau dans le plan (getLevels() vide ou null)");
+                logWriter.flush();
+            }
+            return null;
+        }
+        if (logWriter != null) {
+            logWriter.println("  Niveaux du plan : " + levels.size());
+            logWriter.flush();
+        }
+        for (Level level : levels) {
+            String name = level.getName();
+            String nameTrim = name != null ? name.trim() : "";
+            if (logWriter != null) {
+                logWriter.println("    - \"" + (name != null ? name : "") + "\"");
+                logWriter.flush();
+            }
+            for (String accepted : TERRAIN_LEVEL_NAMES) {
+                if (accepted.equalsIgnoreCase(nameTrim)) {
+                    if (logWriter != null) {
+                        logWriter.println("  Niveau terrain/fondation trouvé (\"" + nameTrim + "\").");
+                        logWriter.flush();
+                    }
+                    return level;
+                }
+            }
+        }
+        if (logWriter != null) {
+            logWriter.println("  Aucun niveau nommé terrain, fondation, foundation ou ground.");
+            logWriter.flush();
+        }
+        return null;
+    }
+    
+    /**
+     * Retourne le niveau (plan) SH3D dont le nom est égal à planName (insensible à la casse).
+     * Log la liste des niveaux si aucun ne correspond.
+     */
+    private static Level findLevelNamed(Home home, String planName, PrintWriter logWriter) {
+        if (home == null || planName == null || planName.trim().isEmpty()) return null;
+        String search = planName.trim();
+        java.util.List<Level> levels = home.getLevels();
+        if (levels == null || levels.isEmpty()) {
+            if (logWriter != null) {
+                logWriter.println("  Aucun niveau dans le plan (getLevels() vide ou null)");
+                logWriter.flush();
+            }
+            return null;
+        }
+        if (logWriter != null) {
+            logWriter.println("  Niveaux du plan : " + levels.size());
+            logWriter.flush();
+        }
+        for (Level level : levels) {
+            String name = level.getName();
+            String nameTrim = name != null ? name.trim() : "";
+            if (logWriter != null) {
+                logWriter.println("    - \"" + (name != null ? name : "") + "\"");
+                logWriter.flush();
+            }
+            if (search.equalsIgnoreCase(nameTrim)) {
+                if (logWriter != null) {
+                    logWriter.println("  Niveau \"" + planName + "\" trouvé.");
+                    logWriter.flush();
+                }
+                return level;
+            }
+        }
+        if (logWriter != null) {
+            logWriter.println("  Aucun niveau nommé \"" + planName + "\".");
+            logWriter.flush();
+        }
+        return null;
+    }
+    
+    /**
+     * Retourne la pièce "terrain" sur le niveau donné : la plus grande en surface (aire),
+     * pour éviter de prendre une pièce intérieure créée par les murs (ex. 9,93×7,92) au lieu du grand sol (12×10).
+     */
+    private static Room findRoomOnLevel(Home home, Level level, PrintWriter logWriter) {
+        if (home == null || level == null) return null;
+        java.util.List<Room> sorted = getAllRoomsOnLevelSortedByArea(home, level);
+        if (sorted == null || sorted.isEmpty()) {
+            if (logWriter != null) {
+                logWriter.println("  Aucune pièce sur ce niveau.");
+                logWriter.flush();
+            }
+            return null;
+        }
+        return sorted.get(0);
+    }
+    
+    /**
+     * Retourne toutes les pièces du niveau donné, triées par aire décroissante (plus grande = terrain/sol en premier).
+     */
+    private static java.util.List<Room> getAllRoomsOnLevelSortedByArea(Home home, Level level) {
+        if (home == null || level == null) return java.util.Collections.emptyList();
+        java.util.List<Room> onLevel = new java.util.ArrayList<Room>();
+        java.util.List<Room> rooms = home.getRooms();
+        if (rooms == null) return onLevel;
+        for (Room room : rooms) {
+            if (room != null && room.isAtLevel(level)) {
+                onLevel.add(room);
+            }
+        }
+        java.util.Collections.sort(onLevel, new java.util.Comparator<Room>() {
+            @Override
+            public int compare(Room a, Room b) {
+                float areaA = a.getArea();
+                float areaB = b.getArea();
+                return Float.compare(areaB, areaA); // décroissant : plus grande d'abord (terrain/sol)
+            }
+        });
+        return onLevel;
+    }
+    
+    /**
+     * Retourne le centre (en cm) du bounding box des murs du niveau donné, ou null si aucun mur.
+     */
+    private static double[] getWallsOnLevelCenterCm(Collection<Wall> walls, Level level) {
+        if (walls == null || level == null) return null;
+        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = Double.MIN_VALUE, maxY = Double.MIN_VALUE;
+        int count = 0;
+        for (Wall w : walls) {
+            if (w == null || !w.isAtLevel(level)) continue;
+            count++;
+            minX = Math.min(minX, Math.min(w.getXStart(), w.getXEnd()));
+            minY = Math.min(minY, Math.min(w.getYStart(), w.getYEnd()));
+            maxX = Math.max(maxX, Math.max(w.getXStart(), w.getXEnd()));
+            maxY = Math.max(maxY, Math.max(w.getYStart(), w.getYEnd()));
+        }
+        if (count == 0) return null;
+        return new double[] { 0.5 * (minX + maxX), 0.5 * (minY + maxY) };
+    }
+    
+    /**
+     * Crée une fondation Energy3D à partir du bounding box des murs du niveau donné (même méthode que pièce : Foundation(largeur, hauteur) + translation).
+     */
+    private static Object createFoundationFromWallsOnLevel(Collection<Wall> walls, Level level, Class<?> foundationClass, double originX, double originY, PrintWriter logWriter) {
+        if (walls == null || level == null) return null;
+        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = Double.MIN_VALUE, maxY = Double.MIN_VALUE;
+        int count = 0;
+        for (Wall w : walls) {
+            if (w == null || !w.isAtLevel(level)) continue;
+            count++;
+            minX = Math.min(minX, Math.min(w.getXStart(), w.getXEnd()));
+            minY = Math.min(minY, Math.min(w.getYStart(), w.getYEnd()));
+            maxX = Math.max(maxX, Math.max(w.getXStart(), w.getXEnd()));
+            maxY = Math.max(maxY, Math.max(w.getYStart(), w.getYEnd()));
+        }
+        if (count == 0) {
+            if (logWriter != null) {
+                logWriter.println("  Aucun mur sur ce niveau.");
+                logWriter.flush();
+            }
+            return null;
+        }
+        return createFoundationFromWallsBounds(foundationClass, minX, minY, maxX, maxY, originX, originY, 50.0, 200.0, logWriter, "Fondation murs: " + count + " mur(s)");
+    }
+    
+    /**
+     * Crée une fondation Energy3D à partir d'un bounding box (cm) avec marge et taille min optionnelles.
+     */
+    private static Object createFoundationFromWallsBounds(Class<?> foundationClass, double minX, double minY, double maxX, double maxY, double originX, double originY, double marginCm, double minSizeCm, PrintWriter logWriter, String logLabel) {
+        minX -= marginCm;
+        minY -= marginCm;
+        maxX += marginCm;
+        maxY += marginCm;
+        if (maxX - minX < minSizeCm) {
+            double cx = (minX + maxX) * 0.5;
+            minX = cx - minSizeCm * 0.5;
+            maxX = cx + minSizeCm * 0.5;
+        }
+        if (maxY - minY < minSizeCm) {
+            double cy = (minY + maxY) * 0.5;
+            minY = cy - minSizeCm * 0.5;
+            maxY = cy + minSizeCm * 0.5;
+        }
+        double relMinX = minX - originX, relMinY = minY - originY, relMaxX = maxX - originX, relMaxY = maxY - originY;
+        double scale = SCALE_CM_TO_ENERGY3D;
+        double x0 = relMinX * scale, y0 = relMinY * scale, x1 = relMaxX * scale, y1 = relMaxY * scale;
+        double widthUnits = x1 - x0, heightUnits = y1 - y0;
+        double centerX = 0.5 * (x0 + x1), centerY = 0.5 * (y0 + y1);
+        if (widthUnits <= 0 || heightUnits <= 0) return null;
+        try {
+            Object foundation = foundationClass.getDeclaredConstructor(double.class, double.class).newInstance(widthUnits, heightUnits);
+            try {
+                java.lang.reflect.Field heightField = foundationClass.getSuperclass().getDeclaredField("height");
+                heightField.setAccessible(true);
+                heightField.setDouble(foundation, FOUNDATION_HEIGHT_UNITS);
+            } catch (Exception ignored) { }
+            setFoundationChildGridSize(foundationClass, foundation, 5.0, logWriter);
+            foundationClass.getMethod("draw").invoke(foundation);
+            ClassLoader loader = foundationClass.getClassLoader();
+            Object root = foundationClass.getMethod("getRoot").invoke(foundation);
+            if (root != null) {
+                root.getClass().getMethod("setTranslation", double.class, double.class, double.class).invoke(root, centerX, centerY, 0.0);
+                try {
+                    Class<?> cullHintClass = loader.loadClass("com.ardor3d.scenegraph.hint.CullHint");
+                    Object cullInherit = cullHintClass.getMethod("valueOf", String.class).invoke(null, "Inherit");
+                    Object sceneHints = root.getClass().getMethod("getSceneHints").invoke(root);
+                    sceneHints.getClass().getMethod("setCullHint", cullHintClass).invoke(sceneHints, cullInherit);
+                } catch (Throwable ignored) { }
+                if (logWriter != null && logLabel != null) logWriter.println("  " + logLabel + ", " + widthUnits + "x" + heightUnits + " u, centre (" + centerX + "," + centerY + ")");
+            }
+            foundationClass.getMethod("draw").invoke(foundation);
+            return foundation;
+        } catch (Throwable t) {
+            if (logWriter != null) {
+                logWriter.println("  createFoundationFromWallsBounds: " + t.getMessage());
+                logWriter.flush();
+            }
+            return null;
+        }
+    }
+    
+    /** Marge (cm) pour la fondation "terrain" (sol vert) à partir du bounding box des murs. */
+    private static final double TERRAIN_GROUND_MARGIN_CM = 300.0;
+    
+    /**
+     * Crée une fondation "terrain" (grand sol) à partir du bounding box des murs du niveau, avec une marge généreuse.
+     */
+    private static Object createTerrainGroundFromWalls(Collection<Wall> walls, Level level, Class<?> foundationClass, double originX, double originY, PrintWriter logWriter) {
+        if (walls == null || level == null) return null;
+        double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = Double.MIN_VALUE, maxY = Double.MIN_VALUE;
+        int count = 0;
+        for (Wall w : walls) {
+            if (w == null || !w.isAtLevel(level)) continue;
+            count++;
+            minX = Math.min(minX, Math.min(w.getXStart(), w.getXEnd()));
+            minY = Math.min(minY, Math.min(w.getYStart(), w.getYEnd()));
+            maxX = Math.max(maxX, Math.max(w.getXStart(), w.getXEnd()));
+            maxY = Math.max(maxY, Math.max(w.getYStart(), w.getYEnd()));
+        }
+        if (count == 0) return null;
+        return createFoundationFromWallsBounds(foundationClass, minX, minY, maxX, maxY, originX, originY, TERRAIN_GROUND_MARGIN_CM, 400.0, logWriter, "Terrain (sol): " + count + " mur(s)");
+    }
+    
+    /**
+     * Définit childGridSize sur une fondation Energy3D. Avec scale 0,2 : childGridSize = 5 → pas 1 m (5×0,2).
+     * Garde la grille 1×1×0,2 m comme Energy3D par défaut.
+     */
+    private static void setFoundationChildGridSize(Class<?> foundationClass, Object foundation, double gridSize, PrintWriter logWriter) {
+        try {
+            java.lang.reflect.Field childGridSizeField = foundationClass.getDeclaredField("childGridSize");
+            childGridSizeField.setAccessible(true);
+            childGridSizeField.setDouble(foundation, gridSize);
+            if (logWriter != null) {
+                logWriter.println("  Fondation childGridSize = " + gridSize + " (pas tracé 1 m avec scale 0,2)");
+                logWriter.flush();
+            }
+        } catch (Exception e) {
+            if (logWriter != null) {
+                logWriter.println("  ⚠ Foundation.childGridSize non modifié: " + e.getMessage());
+                logWriter.flush();
+            }
+        }
+    }
+
+    /**
+     * Crée une fondation Energy3D à partir du sol d'une pièce SH3D (bounding box des points de la pièce).
+     * Utilise le constructeur Foundation(largeur, hauteur) comme Energy3D pour "nouveau projet avec contenu",
+     * afin d'éviter CullHint.Always (réservé au constructeur sans argument). Puis translate le root au centre de la pièce.
+     */
+    private static Object createFoundationFromRoom(Room room, Class<?> foundationClass, double originX, double originY, PrintWriter logWriter) {
+        try {
+            float[][] pts = room.getPoints();
+            if (pts == null || pts.length < 2) return null;
+            double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = Double.MIN_VALUE, maxY = Double.MIN_VALUE;
+            for (int i = 0; i < pts.length; i++) {
+                double px = pts[i][0], py = pts[i][1];
+                minX = Math.min(minX, px);
+                minY = Math.min(minY, py);
+                maxX = Math.max(maxX, px);
+                maxY = Math.max(maxY, py);
+            }
+            double relMinX = minX - originX, relMinY = minY - originY, relMaxX = maxX - originX, relMaxY = maxY - originY;
+            double scale = SCALE_CM_TO_ENERGY3D;
+            double x0 = relMinX * scale, y0 = relMinY * scale, x1 = relMaxX * scale, y1 = relMaxY * scale;
+            if (MIRROR_FLIP_X) { x0 = -x0; x1 = -x1; double t = x0; x0 = x1; x1 = t; }
+            if (ROTATE_180_Z) { y0 = -y0; y1 = -y1; double t = y0; y0 = y1; y1 = t; }
+            double widthUnits = x1 - x0, heightUnits = y1 - y0;
+            double centerX = 0.5 * (x0 + x1), centerY = 0.5 * (y0 + y1);
+            if (widthUnits <= 0 || heightUnits <= 0) return null;
+
+            // Comme Scene.newFile(true) : Foundation(80, 60) — constructeur (double, double) sans CullHint.Always
+            Object foundation = foundationClass.getDeclaredConstructor(double.class, double.class).newInstance(widthUnits, heightUnits);
+
+            // Épaisseur fondation (pièce) : toujours 0,2 m dans Energy3D (unifié pour tous les exports)
+            try {
+                java.lang.reflect.Field heightField = foundationClass.getSuperclass().getDeclaredField("height");
+                heightField.setAccessible(true);
+                heightField.setDouble(foundation, FOUNDATION_HEIGHT_UNITS);
+                if (logWriter != null) logWriter.println("  Fondation height = " + FOUNDATION_HEIGHT_UNITS + " u (0,2 m affiché)");
+            } catch (Exception e) {
+                if (logWriter != null) {
+                    logWriter.println("  ⚠ Foundation.height non modifié: " + e.getMessage());
+                    logWriter.flush();
+                }
+            }
+            setFoundationChildGridSize(foundationClass, foundation, 5.0, logWriter);
+
+            // Texture Energy3D #1 pour la fondation : modification directe du champ textureType (sérialisé dans .ng3)
+            setHousePartTextureType(foundation, foundationClass, 1, logWriter, "fondation");
+            foundationClass.getMethod("draw").invoke(foundation);
+
+            // Positionner la fondation au centre de la pièce (Foundation place par défaut le centre en 0,0)
+            ClassLoader loader = foundationClass.getClassLoader();
+            Object root = foundationClass.getMethod("getRoot").invoke(foundation);
+            if (root != null) {
+                // setTranslation(double, double, double) pour éviter NoSuchMethod avec setTranslation(Vector3) (ClassLoader)
+                root.getClass().getMethod("setTranslation", double.class, double.class, double.class).invoke(root, centerX, centerY, 0.0);
+                // Forcer CullHint.Inherit (même constructeur (double,double) que projet vide = visible)
+                try {
+                    Class<?> cullHintClass = loader.loadClass("com.ardor3d.scenegraph.hint.CullHint");
+                    Object cullInherit = cullHintClass.getMethod("valueOf", String.class).invoke(null, "Inherit");
+                    Object sceneHints = root.getClass().getMethod("getSceneHints").invoke(root);
+                    sceneHints.getClass().getMethod("setCullHint", cullHintClass).invoke(sceneHints, cullInherit);
+                } catch (Throwable ignored) { }
+                if (logWriter != null) logWriter.println("  Sol pièce: " + (widthUnits) + "x" + (heightUnits) + " u, centre (" + centerX + "," + centerY + ")");
+            }
+            foundationClass.getMethod("draw").invoke(foundation);
+            return foundation;
+        } catch (Throwable t) {
+            if (logWriter != null) {
+                logWriter.println("  createFoundationFromRoom: " + t.getMessage());
+                logWriter.flush();
+            }
+            return null;
+        }
+    }
+    
+    /**
+     * Échelle Energy3D par défaut (annotationScale = 0.2) : 1 unité = 0,2 m affiché.
+     * Pour garder la grille 1×1×0,2 m, on n'impose pas scale = 1 et on exporte en unités Energy3D :
+     * 1 m SH3D = 5 unités (5 × 0,2 = 1 m affiché).
+     */
+    private static final double ENERGY3D_DEFAULT_SCALE = 0.2;
+    /** 100 cm SH3D = 5 unités Energy3D → 1 m affiché (avec scale 0,2). */
+    private static final double SCALE_CM_TO_ENERGY3D = 0.05;
+    /** 1 m = 5 unités (avec scale 0,2 : 5 × 0,2 = 1 m affiché). */
+    private static final double ENERGY3D_UNITS_PER_METER_EXPORT = 5.0;
+    /** Hauteur fondation / épaisseur en unités Energy3D : 1 unité = 0,2 m affiché. */
+    private static final double FOUNDATION_HEIGHT_UNITS = 1.0;
+    /** Épaisseur des murs affichée dans Energy3D : 0,2 m. (en unités : 0,2 m / scale 0,2 = 1 unité) */
+    private static final double WALL_THICKNESS_M = 0.2;
+    private static final double WALL_THICKNESS_UNITS = WALL_THICKNESS_M / ENERGY3D_DEFAULT_SCALE;
+    /** Albédo des murs exportés pour obtenir une absorptance de 0,09 (Energy3D : absorptance = 1 - albedo). */
+    private static final float DEFAULT_WALL_ALBEDO = 0.91f;
+    /** Miroir X (symétrie axe Y) : à ajuster selon orientation SH3D vs Energy3D. */
+    private static final boolean MIRROR_FLIP_X = false;
+    /** Rotation 180° plan (inversion Y) : à ajuster pour aligner avec la vue 3D SH3D. */
+    private static final boolean ROTATE_180_Z = true;
+    /** Inverser l'orientation des murs (start/end) pour que la face extérieure en Energy3D corresponde à SH3D (évite les murs "à l'envers"). */
+    private static final boolean WALL_REVERSE_ORIENTATION = true;
+    /** Parcourir les murs dans l'ordre inverse (sens du périmètre attendu par Energy3D pour connectWalls / rendu). */
+    private static final boolean WALLS_TRAVERSE_REVERSE_ORDER = true;
+
+    /**
+     * Fixe le type de texture d'un HousePart (Foundation, Wall). Utilise setTextureType(int) par réflexion.
+     * getMethod() cherche dans la classe et les superclasses (méthode publique HousePart).
+     */
+    private static void setHousePartTextureType(Object part, Class<?> partClass, int textureTypeValue, PrintWriter logWriter, String label) {
+        if (part == null) return;
+        try {
+            // 1) setTextureType(int) via getMethod (inclut les méthodes héritées publiques)
+            java.lang.reflect.Method setTex = part.getClass().getMethod("setTextureType", int.class);
+            setTex.invoke(part, textureTypeValue);
+            if (logWriter != null) logWriter.println("  Texture #" + textureTypeValue + " appliquée (" + label + ")");
+            try {
+                java.lang.reflect.Method updateTex = part.getClass().getMethod("updateTextureAndColor");
+                updateTex.invoke(part);
+            } catch (Throwable ignored) { }
+        } catch (NoSuchMethodException e) {
+            // 2) Fallback : champ textureType
+            try {
+                Class<?> c = part.getClass();
+                java.lang.reflect.Field textureTypeField = null;
+                for (; c != null; c = c.getSuperclass()) {
+                    try {
+                        textureTypeField = c.getDeclaredField("textureType");
+                        break;
+                    } catch (NoSuchFieldException ignored) { }
+                }
+                if (textureTypeField != null) {
+                    textureTypeField.setAccessible(true);
+                    textureTypeField.setInt(part, textureTypeValue);
+                    if (logWriter != null) logWriter.println("  Texture #" + textureTypeValue + " appliquée (" + label + ") via champ");
+                    return;
+                }
+            } catch (Exception e2) {
+                if (logWriter != null) logWriter.println("  ⚠ textureType " + label + ": " + e2.getMessage());
+                return;
+            }
+            if (logWriter != null) logWriter.println("  ⚠ Texture non appliquée pour " + label + ": setTextureType(int) et champ textureType absents du JAR");
+        } catch (Exception e) {
+            if (logWriter != null) logWriter.println("  ⚠ textureType " + textureTypeValue + " " + label + ": " + e.getMessage());
+        }
+    }
+
+    /**
+     * Projette le point (px, py) sur le segment (ax,ay)-(bx,by) et retourne le facteur u tel que
+     * projection = a + u*(b-a). Utilisé pour convertir coordonnées absolues en (u,v) relatives à la fondation.
+     */
+    private static double projectPointOnLineScale(double px, double py, double ax, double ay, double bx, double by) {
+        double dx = bx - ax, dy = by - ay;
+        double lenSq = dx * dx + dy * dy;
+        if (lenSq < 1e-20) return 0.5;
+        return ((px - ax) * dx + (py - ay) * dy) / lenSq;
+    }
+
+    /** Marge (cm) pour considérer qu'une porte/fenêtre est sur un mur (containsPoint). */
+    private static final float DOOR_WINDOW_WALL_MARGIN_CM = 15f;
+
+    /**
+     * Retourne la liste de tous les meubles du plan, y compris ceux à l'intérieur des groupes.
+     * Permet de trouver les portes/fenêtres même si elles sont dans un groupe.
+     */
+    private static List<HomePieceOfFurniture> getAllFurnitureIncludingGroups(Home home) {
+        List<HomePieceOfFurniture> out = new ArrayList<>();
+        List<HomePieceOfFurniture> furniture = home.getFurniture();
+        if (furniture == null) return out;
+        for (HomePieceOfFurniture piece : furniture) {
+            if (piece instanceof HomeFurnitureGroup) {
+                out.addAll(((HomeFurnitureGroup) piece).getAllFurniture());
+            } else {
+                out.add(piece);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * Retourne le mur SH3D sur lequel la porte/fenêtre est placée (centre dans le mur), ou null.
+     * Associe la pièce au mur qui la contient, au même niveau que la pièce (tous niveaux).
+     * 1) Cherche un mur qui contient le point (containsPoint avec marge).
+     * 2) Sinon, fallback : mur dont le segment est le plus proche du point (projection sur le segment).
+     */
+    private static Wall findWallForDoorOrWindow(HomeDoorOrWindow piece, Collection<Wall> walls) {
+        if (walls == null) return null;
+        float x = (float) piece.getX();
+        float y = (float) piece.getY();
+        Level pieceLevel = piece.getLevel();
+        Wall closest = null;
+        double closestDistSq = Double.MAX_VALUE;
+        for (Wall wall : walls) {
+            if (pieceLevel != null && !wall.isAtLevel(pieceLevel)) continue;
+            try {
+                if (wall.containsPoint(x, y, false, DOOR_WINDOW_WALL_MARGIN_CM))
+                    return wall;
+            } catch (Exception ignored) { }
+            double xS = wall.getXStart(), yS = wall.getYStart(), xE = wall.getXEnd(), yE = wall.getYEnd();
+            double dx = xE - xS, dy = yE - yS;
+            double lenSq = dx * dx + dy * dy;
+            if (lenSq < 1e-20) continue;
+            double t = ((x - xS) * dx + (y - yS) * dy) / lenSq;
+            t = Math.max(0, Math.min(1, t));
+            double px = xS + t * dx;
+            double py = yS + t * dy;
+            double distSq = (x - px) * (x - px) + (y - py) * (y - py);
+            if (distSq < closestDistSq) {
+                closestDistSq = distSq;
+                closest = wall;
+            }
+        }
+        return closest;
+    }
+
+    /**
+     * Convertit les fenêtres/portes SH3D situées sur le mur donné en Window Energy3D et les ajoute aux enfants du mur Energy3D.
+     * Parcourt tous les meubles (y compris dans les groupes) et ne garde que les portes/fenêtres (isDoorOrWindow + HomeDoorOrWindow).
+     */
+    private static void convertWindowsOnWall(Home home, Wall sh3dWall, Object energy3dWall, Object foundation,
+            double originX, double originY, Class<?> foundationClass, PrintWriter logWriter) {
+        if (home == null || energy3dWall == null || foundation == null) return;
+        List<HomePieceOfFurniture> furniture = getAllFurnitureIncludingGroups(home);
+        int converted = 0;
+        for (HomePieceOfFurniture piece : furniture) {
+            if (!piece.isDoorOrWindow() || !(piece instanceof HomeDoorOrWindow)) continue;
+            Wall wallForPiece = findWallForDoorOrWindow((HomeDoorOrWindow) piece, home.getWalls());
+            if (wallForPiece != sh3dWall) continue;
+            try {
+                Object window = convertWindowToEnergy3D(home, (HomeDoorOrWindow) piece, sh3dWall, energy3dWall, foundation, originX, originY, foundationClass, logWriter);
+                if (window != null) {
+                    java.lang.reflect.Method getChildrenMethod = energy3dWall.getClass().getMethod("getChildren");
+                    @SuppressWarnings("unchecked")
+                    java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(energy3dWall);
+                    children.add(window);
+                    converted++;
+                    if (logWriter != null) logWriter.println("    ✓ Fenêtre/porte convertie sur ce mur");
+                }
+            } catch (Throwable t) {
+                if (logWriter != null) {
+                    logWriter.println("    ⚠ Fenêtre/porte non convertie: " + t.getMessage());
+                    logWriter.flush();
+                }
+            }
+        }
+        if (converted > 0) {
+            try {
+                energy3dWall.getClass().getMethod("draw").invoke(energy3dWall);
+            } catch (Exception ignored) { }
+        }
+        if (logWriter != null && converted > 0) logWriter.println("  " + converted + " fenêtre(s)/porte(s) sur ce mur");
+    }
+
+    /**
+     * Crée une fenêtre Energy3D à partir d'une porte/fenêtre SH3D sur un mur.
+     * Les points de la fenêtre sont en (u,v,z) relatifs à la fondation (même système que le mur).
+     */
+    private static Object convertWindowToEnergy3D(Home home, HomeDoorOrWindow piece, Wall sh3dWall, Object energy3dWall,
+            Object foundation, double originX, double originY, Class<?> foundationClass, PrintWriter logWriter) {
+        try {
+            Class<?> windowClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Window", logWriter);
+            if (windowClass == null) return null;
+            ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader(logWriter);
+            Class<?> housePartClass = loader.loadClass("org.concord.energy3d.model.HousePart");
+            Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
+            java.lang.reflect.Method vector3Set = vector3Class.getMethod("set", double.class, double.class, double.class);
+
+            // Mur SH3D : segment en cm
+            double xStartCm = sh3dWall.getXStart();
+            double yStartCm = sh3dWall.getYStart();
+            double xEndCm = sh3dWall.getXEnd();
+            double yEndCm = sh3dWall.getYEnd();
+            double wallLengthCm = Math.hypot(xEndCm - xStartCm, yEndCm - yStartCm);
+            if (wallLengthCm < 1e-6) return null;
+
+            // Centre porte/fenêtre en cm, projection sur le segment du mur → paramètre t ∈ [0,1]
+            double pxCm = piece.getX();
+            double pyCm = piece.getY();
+            double tCenter = projectPointOnLineScale(pxCm, pyCm, xStartCm, yStartCm, xEndCm, yEndCm);
+            tCenter = Math.max(0, Math.min(1, tCenter));
+
+            // Ouverture : largeur = wallWidth * width (%), hauteur = wallHeight * height (%)
+            float wallWidth = piece.getWallWidth();
+            float wallHeight = piece.getWallHeight();
+            if (wallWidth <= 0) wallWidth = 1f;
+            if (wallHeight <= 0) wallHeight = 1f;
+            double openingWidthCm = wallWidth * piece.getWidth();
+            double openingHeightCm = wallHeight * piece.getHeight();
+            double halfWidthParam = (openingWidthCm / 2.0) / wallLengthCm;
+            double tLeft = Math.max(0, tCenter - halfWidthParam);
+            double tRight = Math.min(1, tCenter + halfWidthParam);
+
+            // (u,v) du mur en coordonnées fondation : lire les points du mur Energy3D
+            java.lang.reflect.Field pointsField = null;
+            for (Class<?> c = energy3dWall.getClass(); c != null; c = c.getSuperclass()) {
+                try {
+                    pointsField = c.getDeclaredField("points");
+                    break;
+                } catch (NoSuchFieldException ignored) { }
+            }
+            if (pointsField == null) return null;
+            pointsField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> wallPoints = (java.util.List<Object>) pointsField.get(energy3dWall);
+            if (wallPoints == null || wallPoints.size() < 4) return null;
+            Object p0 = wallPoints.get(0);
+            Object p2 = wallPoints.get(2);
+            double uStart = ((Number) p0.getClass().getMethod("getX").invoke(p0)).doubleValue();
+            double vStart = ((Number) p0.getClass().getMethod("getY").invoke(p0)).doubleValue();
+            double uEnd = ((Number) p2.getClass().getMethod("getX").invoke(p2)).doubleValue();
+            double vEnd = ((Number) p2.getClass().getMethod("getY").invoke(p2)).doubleValue();
+
+            // Si les murs sont inversés (WALL_REVERSE_ORIENTATION), le paramètre le long du mur Energy3D est s = 1 - t (SH3D)
+            double sLeft = WALL_REVERSE_ORIENTATION ? (1 - tRight) : tLeft;
+            double sRight = WALL_REVERSE_ORIENTATION ? (1 - tLeft) : tRight;
+            double uLeft = uStart + sLeft * (uEnd - uStart);
+            double vLeft = vStart + sLeft * (vEnd - vStart);
+            double uRight = uStart + sRight * (uEnd - uStart);
+            double vRight = vStart + sRight * (vEnd - vStart);
+
+            // Z : base de la fenêtre = fondation + élévation au sol ; haut = base + hauteur d'ouverture
+            double foundationHeight = ((Number) foundationClass.getMethod("getHeight").invoke(foundation)).doubleValue();
+            float groundElevCm = piece.getGroundElevation();
+            double zBottom = foundationHeight + groundElevCm * SCALE_CM_TO_ENERGY3D;
+            double zTop = zBottom + openingHeightCm * SCALE_CM_TO_ENERGY3D;
+
+            Object window = windowClass.getDeclaredConstructor().newInstance();
+            java.lang.reflect.Method setContainerMethod = windowClass.getMethod("setContainer", housePartClass);
+            setContainerMethod.invoke(window, energy3dWall);
+
+            java.lang.reflect.Field winPointsField = null;
+            for (Class<?> c = windowClass; c != null; c = c.getSuperclass()) {
+                try {
+                    winPointsField = c.getDeclaredField("points");
+                    break;
+                } catch (NoSuchFieldException ignored) { }
+            }
+            if (winPointsField == null) return null;
+            winPointsField.setAccessible(true);
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> winPoints = (java.util.List<Object>) winPointsField.get(window);
+            while (winPoints.size() < 4) {
+                winPoints.add(vector3Class.getConstructor(double.class, double.class, double.class).newInstance(0, 0, 0));
+            }
+            // 0=bas gauche, 1=haut gauche, 2=bas droite, 3=haut droite
+            vector3Set.invoke(winPoints.get(0), uLeft,  vLeft,  zBottom);
+            vector3Set.invoke(winPoints.get(1), uLeft,  vLeft,  zTop);
+            vector3Set.invoke(winPoints.get(2), uRight, vRight, zBottom);
+            vector3Set.invoke(winPoints.get(3), uRight, vRight, zTop);
+
+            try {
+                java.lang.reflect.Field firstPointField = windowClass.getSuperclass().getDeclaredField("firstPointInserted");
+                firstPointField.setAccessible(true);
+                firstPointField.set(window, true);
+            } catch (Exception ignored) { }
+            try {
+                java.lang.reflect.Field drawCompletedField = windowClass.getSuperclass().getDeclaredField("drawCompleted");
+                drawCompletedField.setAccessible(true);
+                drawCompletedField.set(window, true);
+            } catch (Exception ignored) { }
+
+            // Ne pas appeler complete() ni draw() : ils déclenchent SceneManager.getInstance() et MainPanel (non dispo en headless).
+            // Le mur a seulement besoin des points de la fenêtre (getAbsPoint) pour tracer les trous ; pas besoin du mesh de la fenêtre.
+            // Propriétés thermiques par défaut (SHGC, U-value) : réglées par réflexion pour éviter tout code UI
+            try {
+                windowClass.getMethod("setSolarHeatGainCoefficient", double.class).invoke(window, 0.5);
+                windowClass.getMethod("setUValue", double.class).invoke(window, 2.0);
+            } catch (Exception ignored) { }
+            return window;
+        } catch (Throwable t) {
+            Throwable cause = t.getCause() != null ? t.getCause() : t;
+            if (logWriter != null) {
+                logWriter.println("    convertWindowToEnergy3D: " + t.getClass().getSimpleName() + " - " + t.getMessage());
+                logWriter.println("      cause: " + cause.getClass().getSimpleName() + " - " + cause.getMessage());
+                logWriter.flush();
+            }
+            return null;
+        }
+    }
 
     private static Object convertWallToEnergy3D(Wall sh3dWall, Object foundation, double originX, double originY, PrintWriter logWriter) {
         try {
-            // Données dimensionnelles depuis Sweet Home 3D ; positions relatives à l'origine du plan (échelles X/Y corrigées)
             WallConverter.Energy3DWallData data = WallConverter.convertToEnergy3D(sh3dWall);
-            double xStart = (sh3dWall.getXStart() - originX) * WALL_LENGTH_SCALE_X_CM;
-            double yStart = (sh3dWall.getYStart() - originY) * WALL_LENGTH_SCALE_Y_CM;
-            double xEnd   = (sh3dWall.getXEnd()   - originX) * WALL_LENGTH_SCALE_X_CM;
-            double yEnd   = (sh3dWall.getYEnd()   - originY) * WALL_LENGTH_SCALE_Y_CM;
+            // Positions absolues en m (centre plan = origin)
+            double xStart = (sh3dWall.getXStart() - originX) * SCALE_CM_TO_ENERGY3D;
+            double yStart = (sh3dWall.getYStart() - originY) * SCALE_CM_TO_ENERGY3D;
+            double xEnd   = (sh3dWall.getXEnd()   - originX) * SCALE_CM_TO_ENERGY3D;
+            double yEnd   = (sh3dWall.getYEnd()   - originY) * SCALE_CM_TO_ENERGY3D;
             if (MIRROR_FLIP_X) {
                 xStart = -xStart;
                 xEnd   = -xEnd;
             }
-            // Épaisseur mur : SH3D en cm ; défaut 0,2 m = 20 cm si non définie
-            double thicknessCm = data.wallThickness > 0 ? data.wallThickness : 20.0;
-            double thickness = thicknessCm * SCALE_CM_TO_ENERGY3D;
-            // Hauteur : SH3D en cm → Energy3D (1 m = 5 unités) ; si non définie, défaut 2,5 m
+            if (ROTATE_180_Z) {
+                yStart = -yStart;
+                yEnd   = -yEnd;
+            }
+            double thickness = WALL_THICKNESS_UNITS;
             double wallHeight = sh3dWall.getHeight() != null
                 ? sh3dWall.getHeight().doubleValue() * SCALE_CM_TO_ENERGY3D
-                : (2.5 * ENERGY3D_UNITS_PER_METER);
+                : (2.5 * ENERGY3D_UNITS_PER_METER_EXPORT);
+
+            Class<?> foundationClass = foundation.getClass();
+            java.lang.reflect.Method getAbsPoint = foundationClass.getMethod("getAbsPoint", int.class);
+            java.lang.reflect.Method getHeightMethod = foundationClass.getMethod("getHeight");
+            Object p0 = getAbsPoint.invoke(foundation, 0);
+            Object p1 = getAbsPoint.invoke(foundation, 1);
+            Object p2 = getAbsPoint.invoke(foundation, 2);
+            double p0x = ((Number) p0.getClass().getMethod("getX").invoke(p0)).doubleValue();
+            double p0y = ((Number) p0.getClass().getMethod("getY").invoke(p0)).doubleValue();
+            double p1x = ((Number) p1.getClass().getMethod("getX").invoke(p1)).doubleValue();
+            double p1y = ((Number) p1.getClass().getMethod("getY").invoke(p1)).doubleValue();
+            double p2x = ((Number) p2.getClass().getMethod("getX").invoke(p2)).doubleValue();
+            double p2y = ((Number) p2.getClass().getMethod("getY").invoke(p2)).doubleValue();
+            double foundationHeight = ((Number) getHeightMethod.invoke(foundation)).doubleValue();
+
+            // Convertir (x,y) absolu en (u,v) relatif à la fondation (HousePart.toAbsolute : p0 + u*(p2-p0) + v*(p1-p0))
+            double uStart = projectPointOnLineScale(xStart, yStart, p0x, p0y, p2x, p2y);
+            double vStart = projectPointOnLineScale(xStart, yStart, p0x, p0y, p1x, p1y);
+            double uEnd   = projectPointOnLineScale(xEnd,   yEnd,   p0x, p0y, p2x, p2y);
+            double vEnd   = projectPointOnLineScale(xEnd,   yEnd,   p0x, p0y, p1x, p1y);
+            double zBottom = foundationHeight;
+            double zTop = foundationHeight + wallHeight;
 
             Class<?> wallClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Wall", logWriter);
             if (logWriter != null) { logWriter.println("  Instanciation du Wall..."); logWriter.flush(); }
-            Object wall = wallClass.newInstance();
-            // setContainer(HousePart): use HousePart from same ClassLoader as Wall to avoid NoSuchMethodError
+            Object wall = wallClass.getDeclaredConstructor().newInstance();
             Class<?> housePartClass = wallClass.getClassLoader().loadClass("org.concord.energy3d.model.HousePart");
             java.lang.reflect.Method setContainerMethod = wallClass.getMethod("setContainer", housePartClass);
             setContainerMethod.invoke(wall, foundation);
 
-            // Définir épaisseur et hauteur avant les points (utilisées par draw/complete)
             java.lang.reflect.Method setThicknessMethod = wallClass.getMethod("setThickness", double.class);
             setThicknessMethod.invoke(wall, thickness);
             java.lang.reflect.Method setHeightMethod = wallClass.getMethod("setHeight", double.class, boolean.class);
             setHeightMethod.invoke(wall, wallHeight, true);
 
-            // Energy3D Wall a 4 points : 0=start bas, 1=start haut, 2=end bas, 3=end haut (coords fondation)
             ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader(logWriter);
             Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
             java.lang.reflect.Method vector3Set = vector3Class.getMethod("set", double.class, double.class, double.class);
@@ -1759,17 +2468,22 @@ public class PlanExporter {
             @SuppressWarnings("unchecked")
             java.util.List<Object> points = (java.util.List<Object>) pointsField.get(wall);
 
-            // Wall() crée 2 points ; on en a besoin de 4
             while (points.size() < 4) {
-                Object v = vector3Class.getConstructor(double.class, double.class, double.class)
-                    .newInstance(0.0, 0.0, 0.0);
-                points.add(v);
+                points.add(vector3Class.getConstructor(double.class, double.class, double.class).newInstance(0.0, 0.0, 0.0));
             }
-            // point 0 = start bas, 1 = start haut, 2 = end bas, 3 = end haut (z=0 au sol, z=height en haut)
-            vector3Set.invoke(points.get(0), xStart, yStart, 0.0);
-            vector3Set.invoke(points.get(1), xStart, yStart, wallHeight);
-            vector3Set.invoke(points.get(2), xEnd,   yEnd,   0.0);
-            vector3Set.invoke(points.get(3), xEnd,   yEnd,   wallHeight);
+            // Points en (u, v, z) relatifs à la fondation : 0=start bas, 1=start haut, 2=end bas, 3=end haut
+            // Si WALL_REVERSE_ORIENTATION : on inverse start/end pour que la face "avant" en Energy3D = extérieur SH3D (évite murs à l'envers)
+            if (WALL_REVERSE_ORIENTATION) {
+                vector3Set.invoke(points.get(0), uEnd,   vEnd,   zBottom);
+                vector3Set.invoke(points.get(1), uEnd,   vEnd,   zTop);
+                vector3Set.invoke(points.get(2), uStart, vStart, zBottom);
+                vector3Set.invoke(points.get(3), uStart, vStart, zTop);
+            } else {
+                vector3Set.invoke(points.get(0), uStart, vStart, zBottom);
+                vector3Set.invoke(points.get(1), uStart, vStart, zTop);
+                vector3Set.invoke(points.get(2), uEnd,   vEnd,   zBottom);
+                vector3Set.invoke(points.get(3), uEnd,   vEnd,   zTop);
+            }
 
             // Marquer comme "premier point inséré" pour que complete() et draw() fonctionnent
             try {
@@ -1780,20 +2494,32 @@ public class PlanExporter {
                 if (logWriter != null) logWriter.println("  firstPointInserted non défini: " + e.getMessage());
             }
 
-            java.lang.reflect.Method completeMethod = wallClass.getMethod("complete");
-            completeMethod.invoke(wall);
-
-            // Couleur
-            Integer color = sh3dWall.getLeftSideColor();
-            if (color == null) color = sh3dWall.getRightSideColor();
-            if (color != null) {
-                int r = (color >> 16) & 0xFF, g = (color >> 8) & 0xFF, b = color & 0xFF;
-                Class<?> colorClass = Energy3DClassLoader.loadEnergy3DClass("com.ardor3d.math.ColorRGBA", logWriter);
-                Object colorObj = colorClass.getConstructor(float.class, float.class, float.class, float.class)
-                    .newInstance(r / 255.0f, g / 255.0f, b / 255.0f, 1.0f);
-                java.lang.reflect.Method setColorMethod = wallClass.getMethod("setColor", colorClass);
-                setColorMethod.invoke(wall, colorObj);
+            try {
+                java.lang.reflect.Method completeMethod = wallClass.getMethod("complete");
+                completeMethod.invoke(wall);
+            } catch (Throwable e) {
+                // complete() peut échouer en headless (SceneManager, etc.) : forcer drawCompleted et draw() pour que le mur soit valide à l'ouverture
+                if (logWriter != null) logWriter.println("  complete() ignoré (" + e.getMessage() + "), utilisation de draw() direct");
+                try {
+                    java.lang.reflect.Field drawCompletedField = wallClass.getSuperclass().getDeclaredField("drawCompleted");
+                    drawCompletedField.setAccessible(true);
+                    drawCompletedField.set(wall, true);
+                } catch (Exception e2) {
+                    if (logWriter != null) logWriter.println("  drawCompleted non défini: " + e2.getMessage());
+                }
             }
+
+            // Couleur : albedo = 0,91 pour absorptance 0,09 (Energy3D utilise la clarté de la couleur comme albedo)
+            Class<?> colorClass = Energy3DClassLoader.loadEnergy3DClass("com.ardor3d.math.ColorRGBA", logWriter);
+            Object colorObj = colorClass.getConstructor(float.class, float.class, float.class, float.class)
+                .newInstance(DEFAULT_WALL_ALBEDO, DEFAULT_WALL_ALBEDO, DEFAULT_WALL_ALBEDO, 1.0f);
+            // HousePart.setColor(ReadOnlyColorRGBA) : il faut le type déclaré pour getMethod
+            Class<?> readOnlyColorClass = wallClass.getClassLoader().loadClass("com.ardor3d.math.type.ReadOnlyColorRGBA");
+            java.lang.reflect.Method setColorMethod = wallClass.getMethod("setColor", readOnlyColorClass);
+            setColorMethod.invoke(wall, colorObj);
+
+            // Texture Energy3D #3 pour tous les murs : modification directe du champ textureType (sérialisé dans .ng3)
+            setHousePartTextureType(wall, wallClass, 3, logWriter, "mur");
 
             java.lang.reflect.Method setUValueMethod = wallClass.getMethod("setUValue", double.class);
             setUValueMethod.invoke(wall, data.uValue);
@@ -1802,6 +2528,15 @@ public class PlanExporter {
 
             java.lang.reflect.Method drawMethod = wallClass.getMethod("draw");
             drawMethod.invoke(wall);
+
+            // Forcer drawCompleted pour que Energy3D ne supprime pas le mur au cleanup() à l'ouverture
+            try {
+                java.lang.reflect.Field drawCompletedField = wallClass.getSuperclass().getDeclaredField("drawCompleted");
+                drawCompletedField.setAccessible(true);
+                drawCompletedField.set(wall, true);
+            } catch (Exception e) {
+                if (logWriter != null) logWriter.println("  drawCompleted (post-draw) non défini: " + e.getMessage());
+            }
 
             return wall;
         } catch (Throwable t) {
@@ -1833,6 +2568,104 @@ public class PlanExporter {
         }
     }
     
+    /**
+     * Analyse un fichier .ng3 (export plugin ou Energy3D) et affiche les textureType des Foundation/Wall.
+     * À appeler après export pour vérifier l'enregistrement, ou pour comparer avec un fichier Energy3D natif.
+     * @param ng3File fichier .ng3 (ex. plan_energy3d.ng3 ou plan_energy3d2.ng3)
+     * @param logWriter où écrire le rapport (peut être null)
+     */
+    public static void dumpNg3FileTextureTypes(File ng3File, PrintWriter logWriter) {
+        ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader();
+        if (loader != null) {
+            dumpNg3TextureTypes(ng3File, logWriter, loader);
+        } else if (logWriter != null) {
+            logWriter.println("ClassLoader Energy3D non disponible (exporter d'abord un plan).");
+            logWriter.flush();
+        }
+    }
+
+    /**
+     * Relit un fichier .ng3 avec le ClassLoader Energy3D et affiche les textureType des Foundation et Wall.
+     * Permet de vérifier ce qui a été enregistré et de comparer avec un fichier Energy3D natif.
+     */
+    private static void dumpNg3TextureTypes(File ng3File, PrintWriter logWriter, ClassLoader energy3dLoader) {
+        if (logWriter == null || energy3dLoader == null || !ng3File.exists()) return;
+        Thread thread = Thread.currentThread();
+        ClassLoader savedLoader = thread.getContextClassLoader();
+        try {
+            thread.setContextClassLoader(energy3dLoader);
+            try (FileInputStream fis = new FileInputStream(ng3File);
+                 ObjectInputStream ois = new ObjectInputStream(fis)) {
+                Object scene = ois.readObject();
+                Class<?> sceneClass = scene.getClass();
+                java.lang.reflect.Field partsField = sceneClass.getDeclaredField("parts");
+                partsField.setAccessible(true);
+                @SuppressWarnings("unchecked")
+                java.util.List<Object> parts = (java.util.List<Object>) partsField.get(scene);
+                logWriter.println("Vérification textureType dans " + ng3File.getName() + ":");
+                logWriter.println("  Nombre de parts (racine): " + parts.size());
+                java.lang.reflect.Field textureTypeField = null;
+                java.lang.reflect.Field childrenField = null;
+                for (int i = 0; i < parts.size(); i++) {
+                    Object part = parts.get(i);
+                    if (part == null) continue;
+                    Class<?> partClass = part.getClass();
+                    String partClassName = partClass.getName();
+                    if (textureTypeField == null) {
+                        for (Class<?> c = partClass; c != null; c = c.getSuperclass()) {
+                            try {
+                                textureTypeField = c.getDeclaredField("textureType");
+                                textureTypeField.setAccessible(true);
+                                break;
+                            } catch (NoSuchFieldException ignored) { }
+                        }
+                    }
+                    if (textureTypeField != null) {
+                        int tt = textureTypeField.getInt(part);
+                        logWriter.println("  Part[" + i + "] " + partClassName + " → textureType = " + tt);
+                    }
+                    if (partClassName.contains("Foundation") && (childrenField == null || childrenField.getDeclaringClass().isAssignableFrom(partClass))) {
+                        try {
+                            if (childrenField == null) {
+                                for (Class<?> c = partClass; c != null; c = c.getSuperclass()) {
+                                    try {
+                                        childrenField = c.getDeclaredField("children");
+                                        childrenField.setAccessible(true);
+                                        break;
+                                    } catch (NoSuchFieldException ignored) { }
+                                }
+                            }
+                            if (childrenField != null) {
+                                @SuppressWarnings("unchecked")
+                                java.util.List<Object> children = (java.util.List<Object>) childrenField.get(part);
+                                if (children != null) {
+                                    logWriter.println("    Enfants (murs): " + children.size());
+                                    for (int j = 0; j < children.size(); j++) {
+                                        Object child = children.get(j);
+                                        if (child != null && textureTypeField != null) {
+                                            int ctt = textureTypeField.getInt(child);
+                                            logWriter.println("      Enfant[" + j + "] " + child.getClass().getName() + " → textureType = " + ctt);
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            logWriter.println("    (enfants: " + e.getMessage() + ")");
+                        }
+                    }
+                }
+                logWriter.flush();
+            }
+        } catch (Exception e) {
+            if (logWriter != null) {
+                logWriter.println("  Impossible de relire le .ng3 pour vérification: " + e.getMessage());
+                logWriter.flush();
+            }
+        } finally {
+            thread.setContextClassLoader(savedLoader);
+        }
+    }
+
     private static boolean serializeSceneToNG3(Object scene, File outputFile, PrintWriter logWriter) {
         ObjectOutputStream out = null;
         FileOutputStream fos = null;
@@ -1909,9 +2742,15 @@ public class PlanExporter {
             out.close();
             fos.close();
             
+            // Vérifier ce qui a été enregistré (textureType fondation/murs) en relisant le fichier
+            ClassLoader energy3dLoader = Energy3DClassLoader.getEnergy3DClassLoader();
+            if (energy3dLoader != null && logWriter != null) {
+                dumpNg3TextureTypes(outputFile, logWriter, energy3dLoader);
+            }
+            
             // Vérifier le fichier
             if (outputFile.exists() && outputFile.length() > 0) {
-                try (java.io.FileInputStream fis = new java.io.FileInputStream(outputFile)) {
+                try (FileInputStream fis = new FileInputStream(outputFile)) {
                     byte[] header = new byte[4];
                     int read = fis.read(header);
                     if (read == 4) {

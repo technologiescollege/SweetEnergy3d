@@ -64,6 +64,7 @@ public class Ng3CompareMain {
                 dumpFoundation(p, foundationClass, loader);
             } else if (wallClass.isInstance(p)) {
                 System.out.println("  Part[" + i + "] Wall (top-level):");
+                dumpHousePartTextureType(p, wallClass, "    ");
                 dumpWall(p, wallClass);
             }
         }
@@ -81,6 +82,7 @@ public class Ng3CompareMain {
     }
 
     static void dumpFoundation(Object f, Class<?> foundationClass, ClassLoader loader) throws Exception {
+        dumpHousePartTextureType(f, foundationClass, "    ");
         Method getHeight = foundationClass.getSuperclass().getMethod("getHeight");
         double h = ((Number) getHeight.invoke(f)).doubleValue();
         System.out.println("    height = " + h);
@@ -114,10 +116,29 @@ public class Ng3CompareMain {
                 Object ch = children.get(i);
                 if (wallClass.isInstance(ch)) {
                     System.out.println("      child[" + i + "] Wall:");
+                    dumpHousePartTextureType(ch, wallClass, "        ");
                     dumpWall(ch, wallClass);
                 }
             }
         }
+    }
+
+    /** Affiche le textureType d'un HousePart (Foundation ou Wall). Utilise le ClassLoader de part. */
+    static void dumpHousePartTextureType(Object part, Class<?> partClass, String indent) throws Exception {
+        int tt = -999;
+        if (part != null) {
+            ClassLoader loader = part.getClass().getClassLoader();
+            try {
+                Class<?> housePart = loader.loadClass("org.concord.energy3d.model.HousePart");
+                Field ttField = housePart.getDeclaredField("textureType");
+                ttField.setAccessible(true);
+                tt = ttField.getInt(part);
+            } catch (Exception e) {
+                System.out.println(indent + "textureType = (erreur: " + e.getMessage() + ")");
+                return;
+            }
+        }
+        System.out.println(indent + "textureType = " + tt + " (0=aucune, 1=#1 fondation, 3=#3 mur, etc.)");
     }
 
     static void dumpWall(Object w, Class<?> wallClass) throws Exception {
@@ -145,7 +166,7 @@ public class Ng3CompareMain {
 
     public static void main(String[] args) throws Exception {
         String sh3dPath = args != null && args.length > 0 ? args[0] : "C:\\Users\\babas\\Documents\\plan_energy3d.ng3";
-        String e3dPath  = args != null && args.length > 1 ? args[1] : "C:\\Users\\babas\\Documents\\plan_energy.ng3";
+        String e3dPath  = args != null && args.length > 1 ? args[1] : "C:\\Users\\babas\\Documents\\plan_energy3d2.ng3";
 
         File fSh3d = new File(sh3dPath);
         File fE3d  = new File(e3dPath);
