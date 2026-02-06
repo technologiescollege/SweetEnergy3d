@@ -328,34 +328,56 @@ public class PlanExporter {
                 logWriter.println("  Portes/fenêtres dans le plan (tous niveaux, dont groupes): " + doorsWindowsCount);
                 logWriter.flush();
             }
-            // Parcourir les murs dans le sens attendu par Energy3D (connectWalls / périmètre fondation)
-            List<Wall> wallsToProcess = new ArrayList<>(sh3dWalls);
+            // Regrouper les murs par segment 2D (même trace au plan) pour fusionner les murs superposés sur plusieurs niveaux
+            List<List<Wall>> wallGroups = groupWallsBySegment(sh3dWalls, terrainLevel, logWriter);
             if (WALLS_TRAVERSE_REVERSE_ORDER) {
-                Collections.reverse(wallsToProcess);
-                if (logWriter != null) logWriter.println("  Ordre des murs: inversé (sens périmètre Energy3D)");
+                Collections.reverse(wallGroups);
+                if (logWriter != null) logWriter.println("  Ordre des segments: inversé (sens périmètre Energy3D)");
             }
+            double foundationHeightUnits = ((Number) foundationClass.getMethod("getHeight").invoke(foundation)).doubleValue();
             int wallCount = 0;
-            int wallIndex = 0;
-            for (Wall sh3dWall : wallsToProcess) {
-                wallIndex++;
+            int groupIndex = 0;
+            for (List<Wall> group : wallGroups) {
+                groupIndex++;
+                if (group.isEmpty()) continue;
+                Wall representativeWall = group.get(0);
+                double overrideBaseZ = -1;
+                double overrideHeight = -1;
+                if (group.size() > 1) {
+                    // Murs superposés : hauteur cumulée, base = niveau le plus bas
+                    float terrainElev = terrainLevel != null ? terrainLevel.getElevation() : 0f;
+                    float minElev = Float.MAX_VALUE;
+                    double totalHeightCm = 0;
+                    for (Wall w : group) {
+                        Level l = w.getLevel();
+                        if (l != null) minElev = Math.min(minElev, l.getElevation());
+                        Float h = w.getHeight();
+                        totalHeightCm += (h != null ? h.doubleValue() : 250.0);
+                    }
+                    if (minElev == Float.MAX_VALUE) minElev = terrainElev;
+                    overrideBaseZ = foundationHeightUnits + (minElev - terrainElev) * SCALE_CM_TO_ENERGY3D;
+                    overrideHeight = totalHeightCm * SCALE_CM_TO_ENERGY3D;
+                }
                 try {
                     if (logWriter != null) {
-                        logWriter.println("  Mur " + wallIndex + "/" + sh3dWalls.size() + "...");
+                        logWriter.println("  Segment " + groupIndex + "/" + wallGroups.size() + (group.size() > 1 ? " (" + group.size() + " murs fusionnés)" : "") + "...");
                         logWriter.flush();
                     }
-                    Object energy3dWall = convertWallToEnergy3D(sh3dWall, foundation, originX, originY, logWriter);
+                    Object energy3dWall = convertWallToEnergy3D(representativeWall, foundation, originX, originY,
+                            terrainLevel, overrideBaseZ, overrideHeight, logWriter);
                     if (energy3dWall != null) {
-                        // Convertir les fenêtres/portes SH3D sur ce mur en Window Energy3D (avant d'ajouter le mur à la fondation ; tous niveaux)
-                        convertWindowsOnWall(home, sh3dWall, energy3dWall, foundation, originX, originY, foundationClass, logWriter);
+                        for (Wall sh3dWallInGroup : group) {
+                            convertWindowsOnWall(home, sh3dWallInGroup, energy3dWall, foundation, originX, originY, foundationClass, logWriter);
+                        }
                         java.lang.reflect.Method getChildrenMethod = foundationClass.getMethod("getChildren");
                         @SuppressWarnings("unchecked")
                         java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(foundation);
                         children.add(energy3dWall);
                         wallCount++;
-                        if (logWriter != null) { logWriter.println("  ✓ Mur " + wallIndex + " converti"); logWriter.flush(); }
+                        if (logWriter != null) { logWriter.println("  ✓ Segment " + groupIndex + " converti"); logWriter.flush(); }
                     }
                 } catch (Throwable t) {
-                    logWriter.println("  ✗ ERREUR mur " + wallIndex + ": " + t.getMessage());
+                    logWriter.println("  ✗ ERREUR segment " + groupIndex + ": " + t.getMessage());
                     t.printStackTrace(logWriter);
                     logWriter.flush();
                 }
@@ -371,13 +393,32 @@ public class PlanExporter {
             } catch (Exception e) {
                 logWriter.println("AVERTISSEMENT dessin fondation: " + e.getMessage());
             }
+
+            // Si le plan contient un niveau "Toit-gen" (ou "Toit"), créer un toit Energy3D (HipRoof) sur la fondation
+            Level toitGenLevel = null;
+            for (String roofLevelName : ROOF_LEVEL_NAMES) {
+                toitGenLevel = findLevelNamed(home, roofLevelName, logWriter);
+                if (toitGenLevel != null) break;
+            }
+            if (toitGenLevel != null) {
+                try {
+                    addRoofFromToitGenLevel(home, foundation, foundationClass, terrainLevel, toitGenLevel, scene, logWriter);
+                } catch (Throwable t) {
+                    if (logWriter != null) {
+                        logWriter.println("AVERTISSEMENT: toit (niveau Toit-gen) non créé: " + t.getMessage());
+                        logWriter.flush();
+                    }
+                }
+            }
             
             logWriter.println("Ajout de la fondation à la Scene...");
             logWriter.flush();
             addMethod.invoke(scene, foundation, true);
             logWriter.println("✓ Fondation ajoutée à la Scene");
             logWriter.flush();
-            
+
+            addTreesFromHome(home, scene, originX, originY, sceneClass, logWriter);
+
             ensureSceneAnnotationScale(sceneClass, scene, ENERGY3D_DEFAULT_SCALE, logWriter);
             
             // Caméra (comme plan_energy.ng3) : définie juste avant sérialisation pour être bien persistée
@@ -1835,7 +1876,490 @@ public class PlanExporter {
         }
         return null;
     }
+
+    /** Noms acceptés pour le niveau SH3D représentant le toit (conversion en Roof Energy3D). */
+    private static final String[] ROOF_LEVEL_NAMES = { "Toit-gen", "Toit" };
+
+    /**
+     * Crée un toit Energy3D sur la fondation lorsque le plan contient un niveau "Toit-gen".
+     * Pour une empreinte simple (≤4 murs) : HipRoof (2 points Steiner, crête).
+     * Pour une empreinte en L ou complexe (>4 murs) : CustomRoof (un point Steiner par segment de mur),
+     * ce qui permet une triangulation correcte du périmètre complet.
+     */
+    private static void addRoofFromToitGenLevel(Home home, Object foundation, Class<?> foundationClass,
+            Level terrainLevel, Level toitGenLevel, Object scene, PrintWriter logWriter) throws Exception {
+        ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader(logWriter);
+        Class<?> wallClass = loader.loadClass("org.concord.energy3d.model.Wall");
+
+        java.lang.reflect.Method getChildrenMethod = foundationClass.getMethod("getChildren");
+        @SuppressWarnings("unchecked")
+        java.util.List<Object> foundationChildren = (java.util.List<Object>) getChildrenMethod.invoke(foundation);
+        int wallCount = 0;
+        Object firstWall = null;
+        for (Object ch : foundationChildren) {
+            if (wallClass.isInstance(ch)) {
+                if (firstWall == null) firstWall = ch;
+                wallCount++;
+            }
+        }
+        if (firstWall == null) {
+            if (logWriter != null) logWriter.println("  Toit: aucun mur sur la fondation, toit non créé.");
+            return;
+        }
+
+        // Origine plan (centre pièce terrain) pour convertir les points SH3D → Energy3D
+        double originX = 0.0, originY = 0.0;
+        if (terrainLevel != null) {
+            Room terrainRoom = findRoomOnLevel(home, terrainLevel, logWriter);
+            if (terrainRoom != null) {
+                float[][] rpts = terrainRoom.getPoints();
+                if (rpts != null && rpts.length >= 2) {
+                    double rminX = Double.MAX_VALUE, rminY = Double.MAX_VALUE, rmaxX = Double.MIN_VALUE, rmaxY = Double.MIN_VALUE;
+                    for (int i = 0; i < rpts.length; i++) {
+                        rminX = Math.min(rminX, rpts[i][0]);
+                        rminY = Math.min(rminY, rpts[i][1]);
+                        rmaxX = Math.max(rmaxX, rpts[i][0]);
+                        rmaxY = Math.max(rmaxY, rpts[i][1]);
+                    }
+                    originX = 0.5 * (rminX + rmaxX);
+                    originY = 0.5 * (rminY + rmaxY);
+                }
+            }
+        }
+
+        // Hauteur du toit : optionnellement déduite du niveau Toit-gen
+        double roofHeightUnits = 5.0;
+        if (terrainLevel != null && toitGenLevel != null) {
+            float terrainElev = terrainLevel.getElevation();
+            float terrainHeight = terrainLevel.getHeight();
+            float toitElev = toitGenLevel.getElevation();
+            float toitHeight = toitGenLevel.getHeight();
+            float wallTopCm = terrainElev + terrainHeight;
+            float roofPeakCm = toitElev + toitHeight;
+            if (roofPeakCm > wallTopCm) {
+                double roofHeightCm = roofPeakCm - wallTopCm;
+                roofHeightUnits = roofHeightCm * SCALE_CM_TO_ENERGY3D;
+                roofHeightUnits = Math.max(1.0, Math.min(50.0, roofHeightUnits));
+            }
+        }
+
+        // Check for "Toit" furniture on Toit-gen level
+        List<HomePieceOfFurniture> roofFurniture = new ArrayList<>();
+        if (toitGenLevel != null) {
+            for (HomePieceOfFurniture furn : home.getFurniture()) {
+                if (furn.getLevel() == toitGenLevel && furn.getName() != null && 
+                    (furn.getName().toLowerCase().contains("toit") || furn.getName().toLowerCase().contains("roof"))) {
+                    roofFurniture.add(furn);
+                }
+            }
+        }
+
+        // Common classes
+        Class<?> housePartClass = loader.loadClass("org.concord.energy3d.model.HousePart");
+        Class<?> sceneClass = loader.loadClass("org.concord.energy3d.scene.Scene");
+        Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
+        java.lang.reflect.Method vector3Set = vector3Class.getMethod("set", double.class, double.class, double.class);
+        java.lang.reflect.Method toRelativeMethod = housePartClass.getMethod("toRelative", loader.loadClass("com.ardor3d.math.type.ReadOnlyVector3"));
+        java.lang.reflect.Method getAbsPointMethod = firstWall.getClass().getMethod("getAbsPoint", int.class);
+        java.lang.reflect.Method getZMethod = vector3Class.getMethod("getZ");
+
+        // Set Scene instance
+        java.lang.reflect.Field instanceField = sceneClass.getDeclaredField("instance");
+        instanceField.setAccessible(true);
+        Object previousInstance = instanceField.get(null);
+        try {
+            instanceField.set(null, scene);
+
+            if (!roofFurniture.isEmpty()) {
+                // Case 1: Create CustomRoof from UNION of Furniture
+                if (logWriter != null) logWriter.println("  Toit: " + roofFurniture.size() + " meubles 'Toit' trouvés. Fusion et création d'un CustomRoof.");
+                
+                Class<?> customRoofClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.CustomRoof", logWriter);
+                if (customRoofClass == null) return;
+
+                // 1. Compute Union Area of all furniture pieces
+                java.awt.geom.Area unionArea = new java.awt.geom.Area();
+                double maxFurnHeight = 0;
+                
+                for (HomePieceOfFurniture furn : roofFurniture) {
+                    float w = furn.getWidth();
+                    float d = furn.getDepth();
+                    if (furn.getHeight() > maxFurnHeight) maxFurnHeight = furn.getHeight();
+                    
+                    // Furniture rectangle centered at 0,0
+                    java.awt.geom.Path2D.Double rect = new java.awt.geom.Path2D.Double();
+                    rect.moveTo(-w/2.0, -d/2.0);
+                    rect.lineTo(w/2.0, -d/2.0);
+                    rect.lineTo(w/2.0, d/2.0);
+                    rect.lineTo(-w/2.0, d/2.0);
+                    rect.closePath();
+                    
+                    // Transform to world coordinates (translate + rotate)
+                    java.awt.geom.AffineTransform tx = new java.awt.geom.AffineTransform();
+                    tx.translate(furn.getX(), furn.getY());
+                    tx.rotate(furn.getAngle()); // SH3D angle is radians, clockwise? check conventions. 
+                    // SH3D getAngle() is radians, usually CCW in math, but let's trust standard transform.
+                    // Actually SH3D 0 is right, positive is CCW? 
+                    // Let's assume standard AffineTransform rotate works with SH3D angle.
+                    
+                    java.awt.Shape transformedShape = tx.createTransformedShape(rect);
+                    unionArea.add(new java.awt.geom.Area(transformedShape));
+                }
+
+                // 2. Extract Polygons from Union Area
+                // Area might contain multiple disjoint polygons (though unlikely for a single roof).
+                // We handle each disjoint polygon as a separate roof part if needed.
+                java.util.List<java.util.List<double[]>> polygons = new ArrayList<>();
+                java.util.List<double[]> currentPoly = null;
+                double[] coords = new double[6];
+                
+                for (java.awt.geom.PathIterator pi = unionArea.getPathIterator(null); !pi.isDone(); pi.next()) {
+                    int type = pi.currentSegment(coords);
+                    if (type == java.awt.geom.PathIterator.SEG_MOVETO) {
+                        if (currentPoly != null && !currentPoly.isEmpty()) {
+                            polygons.add(currentPoly);
+                        }
+                        currentPoly = new ArrayList<>();
+                        currentPoly.add(new double[]{coords[0], coords[1]});
+                    } else if (type == java.awt.geom.PathIterator.SEG_LINETO) {
+                        if (currentPoly != null) currentPoly.add(new double[]{coords[0], coords[1]});
+                    } else if (type == java.awt.geom.PathIterator.SEG_CLOSE) {
+                        if (currentPoly != null && !currentPoly.isEmpty()) {
+                            // Verify if closed (last point == first point)
+                            double[] first = currentPoly.get(0);
+                            double[] last = currentPoly.get(currentPoly.size() - 1);
+                            if (Math.abs(first[0] - last[0]) > 0.001 || Math.abs(first[1] - last[1]) > 0.001) {
+                                // Add closing segment if missing? Area usually closes it.
+                                // Actually SEG_CLOSE implies line to first point.
+                                // But Energy3D might want explicit points. 
+                                // Let's check if the last point is already the first.
+                            }
+                            polygons.add(currentPoly);
+                            currentPoly = null;
+                        }
+                    }
+                }
+                if (currentPoly != null && !currentPoly.isEmpty()) {
+                    polygons.add(currentPoly);
+                }
+
+                // 3. Create CustomRoof for each polygon
+                Object topPoint = getAbsPointMethod.invoke(firstWall, 1);
+                double wallTopZ = ((Number) getZMethod.invoke(topPoint)).doubleValue();
+                roofHeightUnits = maxFurnHeight * SCALE_CM_TO_ENERGY3D;
+                
+                for (java.util.List<double[]> polyPoints : polygons) {
+                    if (polyPoints.size() < 3) continue;
+                    
+                    Object roof = customRoofClass.getDeclaredConstructor().newInstance();
+                    
+                    // Set container
+                    java.lang.reflect.Method setContainerMethod = customRoofClass.getMethod("setContainer", loader.loadClass("org.concord.energy3d.model.HousePart"));
+                    setContainerMethod.invoke(roof, firstWall);
+                    @SuppressWarnings("unchecked")
+                    java.util.List<Object> wallChildren = (java.util.List<Object>) firstWall.getClass().getMethod("getChildren").invoke(firstWall);
+                    wallChildren.add(roof);
+
+                    // Initialize
+                    customRoofClass.getMethod("complete").invoke(roof);
+                    
+                    // Convert polygon points to Energy3D coords
+                    java.util.List<Object> absPerimeter = new ArrayList<>();
+                    double cx = 0, cy = 0;
+                    
+                    // Check winding? Energy3D might expect specific winding.
+                    // Area usually returns CCW for outer boundaries.
+                    
+                    for (double[] p : polyPoints) {
+                        double px = p[0];
+                        double py = p[1];
+                        
+                        double ex = (px - originX) * SCALE_CM_TO_ENERGY3D;
+                        double ey = (py - originY) * SCALE_CM_TO_ENERGY3D;
+                        if (MIRROR_FLIP_X) ex = -ex;
+                        if (ROTATE_180_Z) ey = -ey;
+                        
+                        cx += ex;
+                        cy += ey;
+                        
+                        Object v = vector3Class.getDeclaredConstructor().newInstance();
+                        vector3Set.invoke(v, ex, ey, wallTopZ); // Base Z
+                        absPerimeter.add(v);
+                    }
+                    cx /= polyPoints.size();
+                    cy /= polyPoints.size();
+                    
+                    // Set points (Center + Perimeter)
+                    Object centerAbs = vector3Class.getDeclaredConstructor().newInstance();
+                    vector3Set.invoke(centerAbs, cx, cy, wallTopZ + roofHeightUnits);
+                    
+                    java.lang.reflect.Field pointsField = null;
+                    for (Class<?> c = customRoofClass; c != null; c = c.getSuperclass()) {
+                        try { pointsField = c.getDeclaredField("points"); break; } catch (NoSuchFieldException ignored) {}
+                    }
+                    if (pointsField != null) {
+                        pointsField.setAccessible(true);
+                        @SuppressWarnings("unchecked")
+                        java.util.List<Object> roofPoints = (java.util.List<Object>) pointsField.get(roof);
+                        roofPoints.clear();
+                        roofPoints.add(toRelativeMethod.invoke(roof, centerAbs)); // Peak
+                        for (Object absP : absPerimeter) {
+                            roofPoints.add(toRelativeMethod.invoke(roof, absP));
+                        }
+                        
+                        // Set flags for CustomRoof
+                        try {
+                            java.lang.reflect.Field recalcField = customRoofClass.getDeclaredField("recalculateEditPoints");
+                            recalcField.setAccessible(true);
+                            recalcField.setBoolean(roof, false); // Manual points
+                            
+                            java.lang.reflect.Field preserveField = customRoofClass.getDeclaredField("preservePointHeights");
+                            preserveField.setAccessible(true);
+                            preserveField.setBoolean(roof, true);
+                        } catch (Exception e) {
+                            if (logWriter != null) logWriter.println("  Toit: flags CustomRoof non définis: " + e.getMessage());
+                        }
+                    }
+                    
+                    // Set Height
+                    java.lang.reflect.Method setHeightMethod = housePartClass.getDeclaredMethod("setHeight", double.class, boolean.class);
+                    setHeightMethod.setAccessible(true);
+                    setHeightMethod.invoke(roof, roofHeightUnits, true);
+
+                    // Texture Energy3D #1 pour le toit (par défaut)
+                    setHousePartTextureType(roof, customRoofClass, 1, logWriter, "toit");
+                    
+                    // Draw
+                    customRoofClass.getMethod("draw").invoke(roof);
+                }
+                
+                foundationClass.getMethod("draw").invoke(foundation);
+                return; // Done
+            }
+
+            // Priorité : si la pièce "Toit-gen" a des points → CustomRoof créé à partir de ces points ; sinon CustomRoof si >4 murs, HipRoof sinon
+            Room roofRoom = findRoomOnLevel(home, toitGenLevel, logWriter);
+            boolean useCustomRoofFromPoints = (roofRoom != null && roofRoom.getPointCount() >= 3);
+            boolean useCustomRoof = useCustomRoofFromPoints || (wallCount > 4);
+            Class<?> roofClass = useCustomRoof
+                    ? Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.CustomRoof", logWriter)
+                    : Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.HipRoof", logWriter);
+            if (roofClass == null) return;
+        
+            Object roof = roofClass.getDeclaredConstructor().newInstance();
+
+            java.lang.reflect.Method setContainerMethod = roofClass.getMethod("setContainer", loader.loadClass("org.concord.energy3d.model.HousePart"));
+            setContainerMethod.invoke(roof, firstWall);
+
+            @SuppressWarnings("unchecked")
+            java.util.List<Object> wallChildren = (java.util.List<Object>) firstWall.getClass().getMethod("getChildren").invoke(firstWall);
+            wallChildren.add(roof);
+
+            roofClass.getMethod("complete").invoke(roof);
+
+            // Texture Energy3D #1 pour le toit (par défaut)
+            setHousePartTextureType(roof, roofClass, 1, logWriter, "toit");
+
+            // CustomRoof : créer le toit à partir des points de la pièce "Toit-gen" (périmètre + faîte), ou recalcul auto si pas de pièce
+            boolean useRoomPolygonForPitchedRoof = false;
+            if (useCustomRoof && useCustomRoofFromPoints) {
+                    float[][] rp = roofRoom.getPoints();
+                    if (rp != null && rp.length >= 3) {
+                        // Z du haut des murs (contenant du toit)
+                        Object topPoint = getAbsPointMethod.invoke(firstWall, 1);
+                        double wallTopZ = ((Number) getZMethod.invoke(topPoint)).doubleValue();
+
+                        // Périmètre en coordonnées Energy3D absolues (x, y, Z par point : murs en pente pris en compte)
+                        java.util.List<Object> absPerimeter = new ArrayList<>(rp.length);
+                        double cx = 0, cy = 0;
+                        for (int i = 0; i < rp.length; i++) {
+                            double x = (rp[i][0] - originX) * SCALE_CM_TO_ENERGY3D;
+                            double y = (rp[i][1] - originY) * SCALE_CM_TO_ENERGY3D;
+                            if (MIRROR_FLIP_X) x = -x;
+                            if (ROTATE_180_Z) y = -y;
+                            cx += x;
+                            cy += y;
+                            double pointZ = computeRoofZAtPoint(home, toitGenLevel, rp[i][0], rp[i][1]);
+                            Object v = vector3Class.getDeclaredConstructor().newInstance();
+                            vector3Set.invoke(v, x, y, pointZ);
+                            absPerimeter.add(v);
+                        }
+                        cx /= rp.length;
+                        cy /= rp.length;
+
+                        // Centre (faîte) en (cx, cy, max Z périmètre + roofHeight)
+                        double baseZForPeak = wallTopZ;
+                        if (!absPerimeter.isEmpty()) {
+                            Object first = absPerimeter.get(0);
+                            baseZForPeak = ((Number) getZMethod.invoke(first)).doubleValue();
+                            for (int i = 1; i < absPerimeter.size(); i++) {
+                                double zi = ((Number) absPerimeter.get(i).getClass().getMethod("getZ").invoke(absPerimeter.get(i))).doubleValue();
+                                if (zi > baseZForPeak) baseZForPeak = zi;
+                            }
+                        }
+                        Object centerAbs = vector3Class.getDeclaredConstructor().newInstance();
+                        vector3Set.invoke(centerAbs, cx, cy, baseZForPeak + roofHeightUnits);
+
+                        // Champ points du toit (HousePart)
+                        java.lang.reflect.Field pointsField = null;
+                        for (Class<?> c = roofClass; c != null; c = c.getSuperclass()) {
+                            try {
+                                pointsField = c.getDeclaredField("points");
+                                break;
+                            } catch (NoSuchFieldException ignored) { }
+                        }
+                        if (pointsField != null) {
+                            pointsField.setAccessible(true);
+                            @SuppressWarnings("unchecked")
+                            java.util.List<Object> roofPoints = (java.util.List<Object>) pointsField.get(roof);
+                            roofPoints.clear();
+                            roofPoints.add(toRelativeMethod.invoke(roof, centerAbs));
+                            for (Object absP : absPerimeter) {
+                                roofPoints.add(toRelativeMethod.invoke(roof, absP));
+                            }
+                            java.lang.reflect.Field recalcField = roofClass.getDeclaredField("recalculateEditPoints");
+                            recalcField.setAccessible(true);
+                            recalcField.setBoolean(roof, false);
+                            try {
+                                java.lang.reflect.Field preserveField = roofClass.getDeclaredField("preservePointHeights");
+                                preserveField.setAccessible(true);
+                                preserveField.setBoolean(roof, true);
+                            } catch (NoSuchFieldException e) {
+                                if (logWriter != null) logWriter.println("  Toit: preservePointHeights non défini (CustomRoof): " + e.getMessage());
+                            }
+                            useRoomPolygonForPitchedRoof = true;
+                            if (logWriter != null) logWriter.println("  Toit: CustomRoof créé à partir des points de la pièce Toit-gen (" + rp.length + " sommets).");
+                        }
+                    }
+            }
+            if (useCustomRoof && !useRoomPolygonForPitchedRoof) {
+                try {
+                    java.lang.reflect.Field recalcField = roofClass.getDeclaredField("recalculateEditPoints");
+                    recalcField.setAccessible(true);
+                    recalcField.setBoolean(roof, true);
+                } catch (Exception e) {
+                    if (logWriter != null) logWriter.println("  Toit: recalculateEditPoints non défini (CustomRoof): " + e.getMessage());
+                }
+            }
+            if (!useCustomRoof) {
+                float[][] rp2 = null;
+                if (roofRoom != null && roofRoom.getPointCount() >= 3) {
+                    rp2 = roofRoom.getPoints();
+                } else {
+                    double minX = Double.MAX_VALUE, minY = Double.MAX_VALUE, maxX = Double.MIN_VALUE, maxY = Double.MIN_VALUE;
+                    for (Wall w : home.getWalls()) {
+                        if (!w.isAtLevel(terrainLevel)) continue;
+                        minX = Math.min(minX, Math.min(w.getXStart(), w.getXEnd()));
+                        minY = Math.min(minY, Math.min(w.getYStart(), w.getYEnd()));
+                        maxX = Math.max(maxX, Math.max(w.getXStart(), w.getXEnd()));
+                        maxY = Math.max(maxY, Math.max(w.getYStart(), w.getYEnd()));
+                    }
+                    if (minX < maxX && minY < maxY) {
+                        rp2 = new float[][] {
+                            {(float)minX, (float)minY},
+                            {(float)maxX, (float)minY},
+                            {(float)maxX, (float)maxY},
+                            {(float)minX, (float)maxY}
+                        };
+                    }
+                }
+                if (rp2 != null) {
+                    Object topPoint = getAbsPointMethod.invoke(firstWall, 1);
+                    double wallTopZ = ((Number) getZMethod.invoke(topPoint)).doubleValue();
+                    java.util.List<Object> absPerimeter2 = new ArrayList<>(rp2.length);
+                    double cx2 = 0, cy2 = 0;
+                    for (int i = 0; i < rp2.length; i++) {
+                        double x = (rp2[i][0] - originX) * SCALE_CM_TO_ENERGY3D;
+                        double y = (rp2[i][1] - originY) * SCALE_CM_TO_ENERGY3D;
+                        if (MIRROR_FLIP_X) x = -x;
+                        if (ROTATE_180_Z) y = -y;
+                        cx2 += x;
+                        cy2 += y;
+                        double pointZ = computeRoofZAtPoint(home, toitGenLevel, rp2[i][0], rp2[i][1]);
+                        Object v = vector3Class.getDeclaredConstructor().newInstance();
+                        vector3Set.invoke(v, x, y, pointZ);
+                        absPerimeter2.add(v);
+                    }
+                    cx2 /= rp2.length;
+                    cy2 /= rp2.length;
+                    double baseZForPeak2 = wallTopZ;
+                    if (!absPerimeter2.isEmpty()) {
+                        Object first = absPerimeter2.get(0);
+                        baseZForPeak2 = ((Number) getZMethod.invoke(first)).doubleValue();
+                        for (int i = 1; i < absPerimeter2.size(); i++) {
+                            double zi = ((Number) absPerimeter2.get(i).getClass().getMethod("getZ").invoke(absPerimeter2.get(i))).doubleValue();
+                            if (zi > baseZForPeak2) baseZForPeak2 = zi;
+                        }
+                    }
+                    Object centerAbs2 = vector3Class.getDeclaredConstructor().newInstance();
+                    vector3Set.invoke(centerAbs2, cx2, cy2, baseZForPeak2 + roofHeightUnits);
+                    java.lang.reflect.Field pointsField2 = null;
+                    for (Class<?> c = roofClass; c != null; c = c.getSuperclass()) {
+                        try {
+                            pointsField2 = c.getDeclaredField("points");
+                            break;
+                        } catch (NoSuchFieldException ignored) { }
+                    }
+                    if (pointsField2 != null) {
+                        pointsField2.setAccessible(true);
+                        @SuppressWarnings("unchecked")
+                        java.util.List<Object> roofPoints2 = (java.util.List<Object>) pointsField2.get(roof);
+                        roofPoints2.clear();
+                        roofPoints2.add(toRelativeMethod.invoke(roof, centerAbs2));
+                        for (Object absP : absPerimeter2) {
+                            roofPoints2.add(toRelativeMethod.invoke(roof, absP));
+                        }
+                    }
+                }
+            }
+
+            java.lang.reflect.Method setHeightMethod = housePartClass.getDeclaredMethod("setHeight", double.class, boolean.class);
+            setHeightMethod.setAccessible(true);
+            setHeightMethod.invoke(roof, roofHeightUnits, true);
+
+            roofClass.getMethod("draw").invoke(roof);
+            foundationClass.getMethod("draw").invoke(foundation);
+
+            if (logWriter != null) {
+                logWriter.println("  ✓ Toit Energy3D (" + (useCustomRoof ? "CustomRoof" : "HipRoof") + ", " + wallCount + " murs) créé à partir du niveau \"Toit-gen\" (hauteur " + roofHeightUnits + " u).");
+                logWriter.flush();
+            }
+        } finally {
+            instanceField.set(null, previousInstance);
+        }
+    }
     
+    /**
+     * Calcule la hauteur Z (en unités Energy3D) du toit au point plan (px, py) en cm SH3D,
+     * à partir des murs du niveau (murs en pente : height / heightAtEnd). Si aucun mur proche, utilise plafond du niveau.
+     */
+    private static double computeRoofZAtPoint(Home home, Level level, double px, double py) {
+        if (home == null || level == null) return (level.getElevation() + level.getHeight()) * SCALE_CM_TO_ENERGY3D;
+        double levelElev = level.getElevation();
+        double levelHeight = level.getHeight();
+        double defaultZ = (levelElev + levelHeight) * SCALE_CM_TO_ENERGY3D;
+        double maxZ = defaultZ;
+        double thresholdCm = 80.0; // point proche d'un mur (cm)
+        for (Wall wall : home.getWalls()) {
+            if (wall.getLevel() != level) continue;
+            float xS = wall.getXStart(), yS = wall.getYStart(), xE = wall.getXEnd(), yE = wall.getYEnd();
+            double dx = xE - xS, dy = yE - yS;
+            double len2 = dx * dx + dy * dy;
+            if (len2 < 1e-6) continue;
+            double t = ((px - xS) * dx + (py - yS) * dy) / len2;
+            t = Math.max(0, Math.min(1, t));
+            double projX = xS + t * dx, projY = yS + t * dy;
+            double dist = Math.hypot(px - projX, py - projY);
+            if (dist > thresholdCm) continue;
+            float hS = wall.getHeight() != null ? wall.getHeight() : 250f;
+            float hE = wall.getHeightAtEnd() != null ? wall.getHeightAtEnd() : hS;
+            double zCm = levelElev + (1 - t) * hS + t * hE;
+            double zUnits = zCm * SCALE_CM_TO_ENERGY3D;
+            if (zUnits > maxZ) maxZ = zUnits;
+        }
+        return maxZ;
+    }
+
     /**
      * Retourne la pièce "terrain" sur le niveau donné : la plus grande en surface (aire),
      * pour éviter de prendre une pièce intérieure créée par les murs (ex. 9,93×7,92) au lieu du grand sol (12×10).
@@ -2086,7 +2610,12 @@ public class PlanExporter {
             return foundation;
         } catch (Throwable t) {
             if (logWriter != null) {
-                logWriter.println("  createFoundationFromRoom: " + t.getMessage());
+                logWriter.println("  createFoundationFromRoom: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                Throwable cause = t.getCause();
+                if (cause != null) {
+                    logWriter.println("    Cause: " + cause.getClass().getSimpleName() + ": " + cause.getMessage());
+                }
+                t.printStackTrace(logWriter);
                 logWriter.flush();
             }
             return null;
@@ -2118,6 +2647,61 @@ public class PlanExporter {
     private static final boolean WALL_REVERSE_ORIENTATION = true;
     /** Parcourir les murs dans l'ordre inverse (sens du périmètre attendu par Energy3D pour connectWalls / rendu). */
     private static final boolean WALLS_TRAVERSE_REVERSE_ORDER = true;
+    /** Tolérance (cm) pour considérer deux segments comme le même mur (arrondi pour clé de regroupement). */
+    private static final double SEGMENT_KEY_TOLERANCE_CM = 1.0;
+
+    /**
+     * Clé canonique pour un segment 2D (mur) : même clé = même trace au plan, tous niveaux confondus.
+     * Les extrémités sont ordonnées pour que (x1,y1) <= (x2,y2) lexicographiquement, puis arrondies à 1 cm.
+     */
+    private static String segmentKey(Wall w) {
+        if (w == null) return "";
+        double x1 = Math.round(w.getXStart() / SEGMENT_KEY_TOLERANCE_CM) * SEGMENT_KEY_TOLERANCE_CM;
+        double y1 = Math.round(w.getYStart() / SEGMENT_KEY_TOLERANCE_CM) * SEGMENT_KEY_TOLERANCE_CM;
+        double x2 = Math.round(w.getXEnd()   / SEGMENT_KEY_TOLERANCE_CM) * SEGMENT_KEY_TOLERANCE_CM;
+        double y2 = Math.round(w.getYEnd()   / SEGMENT_KEY_TOLERANCE_CM) * SEGMENT_KEY_TOLERANCE_CM;
+        if (x1 > x2 || (x1 == x2 && y1 > y2)) {
+            double t = x1; x1 = x2; x2 = t;
+            t = y1; y1 = y2; y2 = t;
+        }
+        return x1 + "," + y1 + "," + x2 + "," + y2;
+    }
+
+    /**
+     * Regroupe les murs par segment 2D (même trace au plan). Chaque groupe est trié par élévation du niveau (bas → haut).
+     * Permet de fusionner les murs superposés sur plusieurs niveaux en un seul mur Energy3D avec hauteur cumulée.
+     */
+    private static List<List<Wall>> groupWallsBySegment(Collection<Wall> walls, final Level terrainLevel, PrintWriter logWriter) {
+        java.util.Map<String, List<Wall>> byKey = new java.util.LinkedHashMap<>();
+        for (Wall w : walls) {
+            String key = segmentKey(w);
+            byKey.computeIfAbsent(key, k -> new ArrayList<>()).add(w);
+        }
+        List<List<Wall>> groups = new ArrayList<>();
+        for (List<Wall> group : byKey.values()) {
+            Collections.sort(group, new java.util.Comparator<Wall>() {
+                @Override
+                public int compare(Wall a, Wall b) {
+                    Level la = a.getLevel();
+                    Level lb = b.getLevel();
+                    if (la == null && lb == null) return 0;
+                    if (la == null) return 1;
+                    if (lb == null) return -1;
+                    float ea = la.getElevation();
+                    float eb = lb.getElevation();
+                    return Float.compare(ea, eb);
+                }
+            });
+            groups.add(group);
+        }
+        if (logWriter != null) {
+            int merged = 0;
+            for (List<Wall> g : groups) if (g.size() > 1) merged++;
+            logWriter.println("  Segments 2D uniques: " + groups.size() + " (dont " + merged + " avec murs fusionnés multi-niveaux)");
+            logWriter.flush();
+        }
+        return groups;
+    }
 
     /**
      * Fixe le type de texture d'un HousePart (Foundation, Wall). Utilise setTextureType(int) par réflexion.
@@ -2149,6 +2733,10 @@ public class PlanExporter {
                     textureTypeField.setAccessible(true);
                     textureTypeField.setInt(part, textureTypeValue);
                     if (logWriter != null) logWriter.println("  Texture #" + textureTypeValue + " appliquée (" + label + ") via champ");
+                    try {
+                        java.lang.reflect.Method updateTex = part.getClass().getMethod("updateTextureAndColor");
+                        updateTex.invoke(part);
+                    } catch (Throwable ignored) { }
                     return;
                 }
             } catch (Exception e2) {
@@ -2170,6 +2758,23 @@ public class PlanExporter {
         double lenSq = dx * dx + dy * dy;
         if (lenSq < 1e-20) return 0.5;
         return ((px - ax) * dx + (py - ay) * dy) / lenSq;
+    }
+
+    /**
+     * Alloue une instance d'une classe sans appeler le constructeur (évite init() et dépendances UI en headless).
+     * Utilise sun.misc.Unsafe.allocateInstance(Class).
+     */
+    private static Object allocateInstanceWithoutConstructor(Class<?> clazz) {
+        try {
+            Class<?> unsafeClass = Class.forName("sun.misc.Unsafe");
+            java.lang.reflect.Field theUnsafe = unsafeClass.getDeclaredField("theUnsafe");
+            theUnsafe.setAccessible(true);
+            Object unsafe = theUnsafe.get(null);
+            java.lang.reflect.Method allocateInstance = unsafeClass.getMethod("allocateInstance", Class.class);
+            return allocateInstance.invoke(unsafe, clazz);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /** Marge (cm) pour considérer qu'une porte/fenêtre est sur un mur (containsPoint). */
@@ -2230,8 +2835,116 @@ public class PlanExporter {
     }
 
     /**
-     * Convertit les fenêtres/portes SH3D situées sur le mur donné en Window Energy3D et les ajoute aux enfants du mur Energy3D.
-     * Parcourt tous les meubles (y compris dans les groupes) et ne garde que les portes/fenêtres (isDoorOrWindow + HomeDoorOrWindow).
+     * Retourne true si le nom évoque une fenêtre (fenêtre, window, etc.).
+     * Utilisé pour que "porte-fenêtre" soit traitée comme fenêtre (transparente) dans Energy3D.
+     */
+    private static boolean nameSuggestsWindow(String name) {
+        if (name == null) return false;
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("fenêtre") || lower.contains("fenetre") || lower.contains("window")
+                || lower.contains("finestra") || lower.contains("ventana") || lower.contains("janela")
+                || lower.contains("fenster") || lower.contains("raam");
+    }
+
+    /**
+     * Retourne true si la pièce SH3D (porte/fenêtre) est considérée comme une porte.
+     * Critère : nom contenant "door", "porte", "porta", "puerta" (insensible à la casse).
+     * Exception : si le nom contient aussi un mot évoquant la fenêtre (ex. "porte-fenêtre"),
+     * on traite comme fenêtre (transparente) dans Energy3D — le mot fenêtre domine.
+     */
+    private static boolean isLikelyDoor(HomeDoorOrWindow piece) {
+        String name = piece.getName();
+        if (name == null) return false;
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        boolean hasDoor = lower.contains("door") || lower.contains("porte") || lower.contains("porta")
+                || lower.contains("puerta") || lower.contains("tür") || lower.contains("deur");
+        if (!hasDoor) return false;
+        if (nameSuggestsWindow(name)) return false;
+        return true;
+    }
+
+    /**
+     * Retourne true si la pièce SH3D est considérée comme un arbre/plante (pour export Energy3D Tree).
+     * Critère : nom contenant "tree", "arbre", "plant", "plante", "baum" (insensible à la casse) et pas une porte/fenêtre.
+     */
+    private static boolean isLikelyTree(HomePieceOfFurniture piece) {
+        if (piece == null || piece.isDoorOrWindow()) return false;
+        String name = piece.getName();
+        if (name == null) return false;
+        String lower = name.toLowerCase(java.util.Locale.ROOT);
+        return lower.contains("tree") || lower.contains("arbre") || lower.contains("plant")
+                || lower.contains("plante") || lower.contains("baum")
+                || lower.contains("arbor") || lower.contains("albero");
+    }
+
+    /**
+     * Crée des arbres Energy3D à partir des meubles SH3D identifiés comme arbres/plantes et les ajoute à la scène.
+     */
+    private static void addTreesFromHome(Home home, Object scene, double originX, double originY,
+            Class<?> sceneClass, PrintWriter logWriter) {
+        if (home == null || scene == null) return;
+        Class<?> treeClass;
+        Class<?> housePartClass;
+        try {
+            treeClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Tree", logWriter);
+            housePartClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.HousePart", logWriter);
+        } catch (ClassNotFoundException e) {
+            if (logWriter != null) logWriter.println("  AVERTISSEMENT: classes Tree/HousePart: " + e.getMessage());
+            return;
+        }
+        if (treeClass == null || housePartClass == null) return;
+        try {
+            java.lang.reflect.Field instanceField = sceneClass.getDeclaredField("instance");
+            instanceField.setAccessible(true);
+            Object previousInstance = instanceField.get(null);
+            try {
+                instanceField.set(null, scene);
+                java.lang.reflect.Method addMethod = sceneClass.getMethod("add", housePartClass, boolean.class);
+                ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader(logWriter);
+                Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
+                java.lang.reflect.Method vector3Set = vector3Class.getMethod("set", double.class, double.class, double.class);
+                java.lang.reflect.Method setLocationMethod = treeClass.getMethod("setLocation", vector3Class);
+                List<HomePieceOfFurniture> furniture = getAllFurnitureIncludingGroups(home);
+                int count = 0;
+                for (HomePieceOfFurniture piece : furniture) {
+                    if (!isLikelyTree(piece)) continue;
+                    Level level = piece.getLevel();
+                    if (level == null) continue;
+                    double xCm = piece.getX();
+                    double yCm = piece.getY();
+                    double zCm = level.getElevation() + piece.getElevation();
+                    double x = (xCm - originX) * SCALE_CM_TO_ENERGY3D;
+                    double y = (yCm - originY) * SCALE_CM_TO_ENERGY3D;
+                    double z = zCm * SCALE_CM_TO_ENERGY3D;
+                    if (MIRROR_FLIP_X) x = -x;
+                    if (ROTATE_180_Z) y = -y;
+                    Object tree = treeClass.getDeclaredConstructor().newInstance();
+                    Object pos = vector3Class.getDeclaredConstructor().newInstance();
+                    vector3Set.invoke(pos, x, y, z);
+                    setLocationMethod.invoke(tree, pos);
+                    treeClass.getMethod("complete").invoke(tree);
+                    treeClass.getMethod("draw").invoke(tree);
+                    addMethod.invoke(scene, tree, true);
+                    count++;
+                }
+                if (logWriter != null && count > 0) {
+                    logWriter.println("  ✓ " + count + " arbre(s) exporté(s) depuis SH3D.");
+                    logWriter.flush();
+                }
+            } finally {
+                instanceField.set(null, previousInstance);
+            }
+        } catch (Exception e) {
+            if (logWriter != null) {
+                logWriter.println("  AVERTISSEMENT: export des arbres: " + e.getMessage());
+                logWriter.flush();
+            }
+        }
+    }
+
+    /**
+     * Convertit les fenêtres/portes SH3D situées sur le mur donné en Window ou Door Energy3D et les ajoute aux enfants du mur.
+     * Porte vs fenêtre : selon le nom de la pièce (isLikelyDoor). Sinon traité comme fenêtre.
      */
     private static void convertWindowsOnWall(Home home, Wall sh3dWall, Object energy3dWall, Object foundation,
             double originX, double originY, Class<?> foundationClass, PrintWriter logWriter) {
@@ -2242,19 +2955,30 @@ public class PlanExporter {
             if (!piece.isDoorOrWindow() || !(piece instanceof HomeDoorOrWindow)) continue;
             Wall wallForPiece = findWallForDoorOrWindow((HomeDoorOrWindow) piece, home.getWalls());
             if (wallForPiece != sh3dWall) continue;
+            boolean isDoor = isLikelyDoor((HomeDoorOrWindow) piece);
+            Class<?> partClass;
             try {
-                Object window = convertWindowToEnergy3D(home, (HomeDoorOrWindow) piece, sh3dWall, energy3dWall, foundation, originX, originY, foundationClass, logWriter);
-                if (window != null) {
+                partClass = isDoor
+                        ? Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Door", logWriter)
+                        : Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Window", logWriter);
+            } catch (ClassNotFoundException e) {
+                if (logWriter != null) logWriter.println("    ⚠ Classe " + (isDoor ? "Door" : "Window") + " Energy3D introuvable: " + e.getMessage());
+                continue;
+            }
+            if (partClass == null) continue;
+            try {
+                Object part = convertDoorOrWindowToEnergy3D(home, (HomeDoorOrWindow) piece, sh3dWall, energy3dWall, foundation, foundationClass, partClass, logWriter);
+                if (part != null) {
                     java.lang.reflect.Method getChildrenMethod = energy3dWall.getClass().getMethod("getChildren");
                     @SuppressWarnings("unchecked")
                     java.util.List<Object> children = (java.util.List<Object>) getChildrenMethod.invoke(energy3dWall);
-                    children.add(window);
+                    children.add(part);
                     converted++;
-                    if (logWriter != null) logWriter.println("    ✓ Fenêtre/porte convertie sur ce mur");
+                    if (logWriter != null) logWriter.println("    ✓ " + (isDoor ? "Porte" : "Fenêtre") + " convertie sur ce mur");
                 }
             } catch (Throwable t) {
                 if (logWriter != null) {
-                    logWriter.println("    ⚠ Fenêtre/porte non convertie: " + t.getMessage());
+                    logWriter.println("    ⚠ " + (isDoor ? "Porte" : "Fenêtre") + " non convertie: " + t.getMessage());
                     logWriter.flush();
                 }
             }
@@ -2268,14 +2992,13 @@ public class PlanExporter {
     }
 
     /**
-     * Crée une fenêtre Energy3D à partir d'une porte/fenêtre SH3D sur un mur.
-     * Les points de la fenêtre sont en (u,v,z) relatifs à la fondation (même système que le mur).
+     * Crée une fenêtre ou une porte Energy3D à partir d'une porte/fenêtre SH3D sur un mur.
+     * partClass = Window.class ou Door.class (Energy3D). Les points sont en (x, 0, z) relatifs au mur (fractions 0-1).
      */
-    private static Object convertWindowToEnergy3D(Home home, HomeDoorOrWindow piece, Wall sh3dWall, Object energy3dWall,
-            Object foundation, double originX, double originY, Class<?> foundationClass, PrintWriter logWriter) {
+    private static Object convertDoorOrWindowToEnergy3D(Home home, HomeDoorOrWindow piece, Wall sh3dWall, Object energy3dWall,
+            Object foundation, Class<?> foundationClass, Class<?> partClass, PrintWriter logWriter) {
         try {
-            Class<?> windowClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Window", logWriter);
-            if (windowClass == null) return null;
+            if (partClass == null) return null;
             ClassLoader loader = Energy3DClassLoader.getEnergy3DClassLoader(logWriter);
             Class<?> housePartClass = loader.loadClass("org.concord.energy3d.model.HousePart");
             Class<?> vector3Class = loader.loadClass("com.ardor3d.math.Vector3");
@@ -2295,13 +3018,22 @@ public class PlanExporter {
             double tCenter = projectPointOnLineScale(pxCm, pyCm, xStartCm, yStartCm, xEndCm, yEndCm);
             tCenter = Math.max(0, Math.min(1, tCenter));
 
-            // Ouverture : largeur = wallWidth * width (%), hauteur = wallHeight * height (%)
-            float wallWidth = piece.getWallWidth();
-            float wallHeight = piece.getWallHeight();
-            if (wallWidth <= 0) wallWidth = 1f;
-            if (wallHeight <= 0) wallHeight = 1f;
-            double openingWidthCm = wallWidth * piece.getWidth();
-            double openingHeightCm = wallHeight * piece.getHeight();
+            // Ouverture : dimensions cohérentes avec le mur (SH3D : getWidth/getHeight en cm ; getWallWidth/getWallHeight = fraction 0–1)
+            double wallHeightCm = sh3dWall.getHeight() != null ? sh3dWall.getHeight().doubleValue() : 250.0;
+            float ww = piece.getWallWidth();
+            float wh = piece.getWallHeight();
+            if (ww <= 0) ww = 1f;
+            if (wh <= 0) wh = 1f;
+            if (ww > 1f) ww = ww / 100f;
+            if (wh > 1f) wh = wh / 100f;
+            // Largeur = fraction du mur OU taille pièce, plafonnée à 80 % du mur pour éviter fenêtres démesurées
+            double openingWidthCm = ww * piece.getWidth();
+            if (openingWidthCm > wallLengthCm * 0.8) openingWidthCm = wallLengthCm * 0.8;
+            if (openingWidthCm < 20 && piece.getWidth() > 20) openingWidthCm = Math.min(piece.getWidth(), wallLengthCm * 0.8);
+            // Hauteur = fraction du mur OU taille pièce, plafonnée à 85 % du mur
+            double openingHeightCm = wh * piece.getHeight();
+            if (openingHeightCm > wallHeightCm * 0.85) openingHeightCm = wallHeightCm * 0.85;
+            if (openingHeightCm < 40 && piece.getHeight() > 40) openingHeightCm = Math.min(piece.getHeight(), wallHeightCm * 0.85);
             double halfWidthParam = (openingWidthCm / 2.0) / wallLengthCm;
             double tLeft = Math.max(0, tCenter - halfWidthParam);
             double tRight = Math.min(1, tCenter + halfWidthParam);
@@ -2320,32 +3052,49 @@ public class PlanExporter {
             java.util.List<Object> wallPoints = (java.util.List<Object>) pointsField.get(energy3dWall);
             if (wallPoints == null || wallPoints.size() < 4) return null;
             Object p0 = wallPoints.get(0);
-            Object p2 = wallPoints.get(2);
-            double uStart = ((Number) p0.getClass().getMethod("getX").invoke(p0)).doubleValue();
-            double vStart = ((Number) p0.getClass().getMethod("getY").invoke(p0)).doubleValue();
-            double uEnd = ((Number) p2.getClass().getMethod("getX").invoke(p2)).doubleValue();
-            double vEnd = ((Number) p2.getClass().getMethod("getY").invoke(p2)).doubleValue();
 
-            // Si les murs sont inversés (WALL_REVERSE_ORIENTATION), le paramètre le long du mur Energy3D est s = 1 - t (SH3D)
+            // Paramètre le long du mur (0-1) : Energy3D attend des coordonnées relatives au mur (HousePart.toAbsolute).
+            // x = fraction le long du mur, z = fraction de la hauteur du mur (0 = base, 1 = haut).
             double sLeft = WALL_REVERSE_ORIENTATION ? (1 - tRight) : tLeft;
             double sRight = WALL_REVERSE_ORIENTATION ? (1 - tLeft) : tRight;
-            double uLeft = uStart + sLeft * (uEnd - uStart);
-            double vLeft = vStart + sLeft * (vEnd - vStart);
-            double uRight = uStart + sRight * (uEnd - uStart);
-            double vRight = vStart + sRight * (vEnd - vStart);
 
-            // Z : base de la fenêtre = fondation + élévation au sol ; haut = base + hauteur d'ouverture
+            // Hauteur du mur et base Z (pour convertir z absolu en fraction 0-1)
+            Object p1Wall = wallPoints.get(1);
+            double wallZBottom = ((Number) p0.getClass().getMethod("getZ").invoke(p0)).doubleValue();
+            double wallZTop = ((Number) p1Wall.getClass().getMethod("getZ").invoke(p1Wall)).doubleValue();
+            double wallHeight = wallZTop - wallZBottom;
+            if (wallHeight < 1e-6) return null;
+
+            // Z absolus de la fenêtre (base et haut)
             double foundationHeight = ((Number) foundationClass.getMethod("getHeight").invoke(foundation)).doubleValue();
             float groundElevCm = piece.getGroundElevation();
-            double zBottom = foundationHeight + groundElevCm * SCALE_CM_TO_ENERGY3D;
-            double zTop = zBottom + openingHeightCm * SCALE_CM_TO_ENERGY3D;
+            double zBottomAbs = foundationHeight + groundElevCm * SCALE_CM_TO_ENERGY3D;
+            double zTopAbs = zBottomAbs + openingHeightCm * SCALE_CM_TO_ENERGY3D;
+            // Fractions 0-1 le long de la hauteur du mur (comme dans plan_energy3d2.ng3 créé par Energy3D)
+            double zBottomFraction = Math.max(0, Math.min(1, (zBottomAbs - wallZBottom) / wallHeight));
+            double zTopFraction = Math.max(0, Math.min(1, (zTopAbs - wallZBottom) / wallHeight));
 
-            Object window = windowClass.getDeclaredConstructor().newInstance();
-            java.lang.reflect.Method setContainerMethod = windowClass.getMethod("setContainer", housePartClass);
+            // Créer la fenêtre/porte sans constructeur pour éviter init() → NPE en headless
+            Object window = allocateInstanceWithoutConstructor(partClass);
+            if (window == null) return null;
+
+            java.lang.reflect.Method setContainerMethod = partClass.getMethod("setContainer", housePartClass);
             setContainerMethod.invoke(window, energy3dWall);
 
+            // Points en coordonnées relatives au mur : (x = fraction longueur 0-1, y = 0, z = fraction hauteur 0-1)
+            Object winPointsList = loader.loadClass("java.util.ArrayList").getDeclaredConstructor().newInstance();
+            java.lang.reflect.Method listAdd = winPointsList.getClass().getMethod("add", Object.class);
+            java.lang.reflect.Method listGet = winPointsList.getClass().getMethod("get", int.class);
+            for (int i = 0; i < 4; i++) {
+                listAdd.invoke(winPointsList, vector3Class.getConstructor(double.class, double.class, double.class).newInstance(0, 0, 0));
+            }
+            vector3Set.invoke(listGet.invoke(winPointsList, 0), sLeft,  0, zBottomFraction);
+            vector3Set.invoke(listGet.invoke(winPointsList, 1), sLeft,  0, zTopFraction);
+            vector3Set.invoke(listGet.invoke(winPointsList, 2), sRight, 0, zBottomFraction);
+            vector3Set.invoke(listGet.invoke(winPointsList, 3), sRight, 0, zTopFraction);
+
             java.lang.reflect.Field winPointsField = null;
-            for (Class<?> c = windowClass; c != null; c = c.getSuperclass()) {
+            for (Class<?> c = partClass; c != null; c = c.getSuperclass()) {
                 try {
                     winPointsField = c.getDeclaredField("points");
                     break;
@@ -2353,40 +3102,65 @@ public class PlanExporter {
             }
             if (winPointsField == null) return null;
             winPointsField.setAccessible(true);
-            @SuppressWarnings("unchecked")
-            java.util.List<Object> winPoints = (java.util.List<Object>) winPointsField.get(window);
-            while (winPoints.size() < 4) {
-                winPoints.add(vector3Class.getConstructor(double.class, double.class, double.class).newInstance(0, 0, 0));
-            }
-            // 0=bas gauche, 1=haut gauche, 2=bas droite, 3=haut droite
-            vector3Set.invoke(winPoints.get(0), uLeft,  vLeft,  zBottom);
-            vector3Set.invoke(winPoints.get(1), uLeft,  vLeft,  zTop);
-            vector3Set.invoke(winPoints.get(2), uRight, vRight, zBottom);
-            vector3Set.invoke(winPoints.get(3), uRight, vRight, zTop);
+            winPointsField.set(window, winPointsList);
 
+            // Champs HousePart requis pour sérialisation / ouverture Energy3D
             try {
-                java.lang.reflect.Field firstPointField = windowClass.getSuperclass().getDeclaredField("firstPointInserted");
+                java.lang.reflect.Field firstPointField = partClass.getSuperclass().getDeclaredField("firstPointInserted");
                 firstPointField.setAccessible(true);
                 firstPointField.set(window, true);
             } catch (Exception ignored) { }
             try {
-                java.lang.reflect.Field drawCompletedField = windowClass.getSuperclass().getDeclaredField("drawCompleted");
+                java.lang.reflect.Field drawCompletedField = partClass.getSuperclass().getDeclaredField("drawCompleted");
                 drawCompletedField.setAccessible(true);
                 drawCompletedField.set(window, true);
             } catch (Exception ignored) { }
-
-            // Ne pas appeler complete() ni draw() : ils déclenchent SceneManager.getInstance() et MainPanel (non dispo en headless).
-            // Le mur a seulement besoin des points de la fenêtre (getAbsPoint) pour tracer les trous ; pas besoin du mesh de la fenêtre.
-            // Propriétés thermiques par défaut (SHGC, U-value) : réglées par réflexion pour éviter tout code UI
             try {
-                windowClass.getMethod("setSolarHeatGainCoefficient", double.class).invoke(window, 0.5);
-                windowClass.getMethod("setUValue", double.class).invoke(window, 2.0);
+                java.lang.reflect.Field heightField = partClass.getSuperclass().getDeclaredField("height");
+                heightField.setAccessible(true);
+                heightField.setDouble(window, (zTopAbs - zBottomAbs));
+            } catch (Exception ignored) { }
+            try {
+                java.lang.reflect.Field idField = partClass.getSuperclass().getDeclaredField("id");
+                idField.setAccessible(true);
+                if (idField.getLong(window) == 0L)
+                    idField.setLong(window, System.nanoTime());
+            } catch (Exception ignored) { }
+
+            // Root non-null pour que Scene.add() → getRoot() ne déclenche pas init() (NPE en headless)
+            try {
+                Class<?> nodeClass = loader.loadClass("com.ardor3d.scenegraph.Node");
+                Object rootNode = nodeClass.getConstructor(String.class).newInstance(partClass.getSimpleName());
+                java.lang.reflect.Field rootField = partClass.getSuperclass().getDeclaredField("root");
+                rootField.setAccessible(true);
+                rootField.set(window, rootNode);
+            } catch (Exception e) {
+                if (logWriter != null) logWriter.println("    root " + partClass.getSimpleName() + " non défini: " + e.getMessage());
+            }
+            // children non-null pour que Scene.add() → part.getChildren() ne lance pas NPE (instance créée sans constructeur)
+            try {
+                java.lang.reflect.Field childrenField = partClass.getSuperclass().getDeclaredField("children");
+                childrenField.setAccessible(true);
+                if (childrenField.get(window) == null) {
+                    Object emptyList = loader.loadClass("java.util.ArrayList").getDeclaredConstructor().newInstance();
+                    childrenField.set(window, emptyList);
+                }
+            } catch (Exception e) {
+                if (logWriter != null) logWriter.println("    children " + partClass.getSimpleName() + " non défini: " + e.getMessage());
+            }
+
+            // Propriétés thermiques : U-value (Window et Door), SHGC (Window uniquement)
+            try {
+                partClass.getMethod("setUValue", double.class).invoke(window, 2.0);
+            } catch (Exception ignored) { }
+            try {
+                partClass.getMethod("setSolarHeatGainCoefficient", double.class).invoke(window, 0.5);
             } catch (Exception ignored) { }
             return window;
         } catch (Throwable t) {
             Throwable cause = t.getCause() != null ? t.getCause() : t;
             if (logWriter != null) {
-                logWriter.println("    convertWindowToEnergy3D: " + t.getClass().getSimpleName() + " - " + t.getMessage());
+                logWriter.println("    convertDoorOrWindowToEnergy3D: " + t.getClass().getSimpleName() + " - " + t.getMessage());
                 logWriter.println("      cause: " + cause.getClass().getSimpleName() + " - " + cause.getMessage());
                 logWriter.flush();
             }
@@ -2394,7 +3168,13 @@ public class PlanExporter {
         }
     }
 
-    private static Object convertWallToEnergy3D(Wall sh3dWall, Object foundation, double originX, double originY, PrintWriter logWriter) {
+    /**
+     * Convertit un mur SH3D en mur Energy3D.
+     * @param overrideBaseZUnits base Z en unités (au-dessus de la fondation). Si &lt;= 0 et overrideHeightUnits &lt;= 0, calculée depuis le niveau du mur.
+     * @param overrideHeightUnits hauteur en unités. Si &gt; 0, utilisée (mur fusionné multi-niveaux) ; sinon hauteur du mur seul.
+     */
+    private static Object convertWallToEnergy3D(Wall sh3dWall, Object foundation, double originX, double originY,
+            Level terrainLevel, double overrideBaseZUnits, double overrideHeightUnits, PrintWriter logWriter) {
         try {
             WallConverter.Energy3DWallData data = WallConverter.convertToEnergy3D(sh3dWall);
             // Positions absolues en m (centre plan = origin)
@@ -2411,9 +3191,6 @@ public class PlanExporter {
                 yEnd   = -yEnd;
             }
             double thickness = WALL_THICKNESS_UNITS;
-            double wallHeight = sh3dWall.getHeight() != null
-                ? sh3dWall.getHeight().doubleValue() * SCALE_CM_TO_ENERGY3D
-                : (2.5 * ENERGY3D_UNITS_PER_METER_EXPORT);
 
             Class<?> foundationClass = foundation.getClass();
             java.lang.reflect.Method getAbsPoint = foundationClass.getMethod("getAbsPoint", int.class);
@@ -2429,13 +3206,31 @@ public class PlanExporter {
             double p2y = ((Number) p2.getClass().getMethod("getY").invoke(p2)).doubleValue();
             double foundationHeight = ((Number) getHeightMethod.invoke(foundation)).doubleValue();
 
+            double wallHeight;
+            double zBottom;
+            if (overrideHeightUnits > 0) {
+                wallHeight = overrideHeightUnits;
+                zBottom = overrideBaseZUnits > 0 ? overrideBaseZUnits : foundationHeight;
+            } else {
+                wallHeight = sh3dWall.getHeight() != null
+                    ? sh3dWall.getHeight().doubleValue() * SCALE_CM_TO_ENERGY3D
+                    : (2.5 * ENERGY3D_UNITS_PER_METER_EXPORT);
+                Level level = sh3dWall.getLevel();
+                if (terrainLevel != null && level != null) {
+                    float levelElev = level.getElevation();
+                    float terrainElev = terrainLevel.getElevation();
+                    zBottom = foundationHeight + (levelElev - terrainElev) * SCALE_CM_TO_ENERGY3D;
+                } else {
+                    zBottom = foundationHeight;
+                }
+            }
+            double zTop = zBottom + wallHeight;
+
             // Convertir (x,y) absolu en (u,v) relatif à la fondation (HousePart.toAbsolute : p0 + u*(p2-p0) + v*(p1-p0))
             double uStart = projectPointOnLineScale(xStart, yStart, p0x, p0y, p2x, p2y);
             double vStart = projectPointOnLineScale(xStart, yStart, p0x, p0y, p1x, p1y);
             double uEnd   = projectPointOnLineScale(xEnd,   yEnd,   p0x, p0y, p2x, p2y);
             double vEnd   = projectPointOnLineScale(xEnd,   yEnd,   p0x, p0y, p1x, p1y);
-            double zBottom = foundationHeight;
-            double zTop = foundationHeight + wallHeight;
 
             Class<?> wallClass = Energy3DClassLoader.loadEnergy3DClass("org.concord.energy3d.model.Wall", logWriter);
             if (logWriter != null) { logWriter.println("  Instanciation du Wall..."); logWriter.flush(); }
@@ -2518,8 +3313,8 @@ public class PlanExporter {
             java.lang.reflect.Method setColorMethod = wallClass.getMethod("setColor", readOnlyColorClass);
             setColorMethod.invoke(wall, colorObj);
 
-            // Texture Energy3D #3 pour tous les murs : modification directe du champ textureType (sérialisé dans .ng3)
-            setHousePartTextureType(wall, wallClass, 3, logWriter, "mur");
+            // Texture Energy3D #1 par défaut pour les murs
+            setHousePartTextureType(wall, wallClass, 1, logWriter, "mur");
 
             java.lang.reflect.Method setUValueMethod = wallClass.getMethod("setUValue", double.class);
             setUValueMethod.invoke(wall, data.uValue);

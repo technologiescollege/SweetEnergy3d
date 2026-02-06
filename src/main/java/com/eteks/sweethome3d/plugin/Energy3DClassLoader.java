@@ -61,7 +61,7 @@ public class Energy3DClassLoader {
                 // Chercher energy3d.jar dans plusieurs emplacements relatifs au plugin
                 // Le plugin est dans data/plugins/, donc on cherche depuis le répertoire Sweet Home 3D
                 // Structure: SweetHome3D-7.5-portable/data/plugins/sweetenergy3d.sh3p
-                // On cherche: ../../../energy3d_src/exe/energy3d.jar (depuis plugins/)
+                // On cherche: ../../../energy3d/exe/energy3d.jar (depuis plugins/)
                 File[] searchDirs = {
                     pluginDir != null ? pluginDir.getParentFile() : null,  // ../ depuis plugins/ -> data/
                     pluginDir != null && pluginDir.getParentFile() != null ? pluginDir.getParentFile().getParentFile() : null,  // ../../ depuis plugins/ -> SweetHome3D-7.5-portable/
@@ -78,8 +78,8 @@ public class Energy3DClassLoader {
                         logWriter.flush();
                     }
                     
-                    // Essayer energy3d_src/exe/energy3d.jar
-                    File testJar = new File(searchDir, "energy3d_src/exe/energy3d.jar");
+                    // Essayer energy3d/exe/energy3d.jar
+                    File testJar = new File(searchDir, "energy3d/exe/energy3d.jar");
                     if (logWriter != null) {
                         logWriter.println("  Test: " + testJar.getAbsolutePath() + " (existe: " + testJar.exists() + ")");
                         logWriter.flush();
@@ -93,9 +93,9 @@ public class Energy3DClassLoader {
                         break;
                     }
                     
-                    // Essayer ../energy3d_src/exe/energy3d.jar
+                    // Essayer ../energy3d/exe/energy3d.jar
                     if (searchDir.getParentFile() != null) {
-                        testJar = new File(searchDir.getParentFile(), "energy3d_src/exe/energy3d.jar");
+                        testJar = new File(searchDir.getParentFile(), "energy3d/exe/energy3d.jar");
                         if (logWriter != null) {
                             logWriter.println("  Test: " + testJar.getAbsolutePath() + " (existe: " + testJar.exists() + ")");
                             logWriter.flush();
@@ -125,10 +125,10 @@ public class Energy3DClassLoader {
                     logWriter.flush();
                 }
                 String[] possiblePaths = {
-                    System.getProperty("user.dir") + "/energy3d_src/exe/energy3d.jar",
-                    System.getProperty("user.dir") + "/../energy3d_src/exe/energy3d.jar",
-                    "../energy3d_src/exe/energy3d.jar",
-                    "../../energy3d_src/exe/energy3d.jar",
+                    System.getProperty("user.dir") + "/energy3d/exe/energy3d.jar",
+                    System.getProperty("user.dir") + "/../energy3d/exe/energy3d.jar",
+                    "../energy3d/exe/energy3d.jar",
+                    "../../energy3d/exe/energy3d.jar",
                 };
                 
                 for (String path : possiblePaths) {
@@ -151,7 +151,7 @@ public class Energy3DClassLoader {
             if (energy3dJar == null || !energy3dJar.exists()) {
                 if (logWriter != null) {
                     logWriter.println("✗ ERREUR: JAR Energy3D non trouvé!");
-                    logWriter.println("Vérifiez que energy3d.jar existe dans energy3d_src/exe/");
+                    logWriter.println("Vérifiez que energy3d.jar existe dans energy3d/exe/");
                     logWriter.flush();
                 }
                 return null;
@@ -362,7 +362,7 @@ public class Energy3DClassLoader {
                         name.equals("com.ardor3d.renderer.state.LightState") ||
                         name.equals("com.ardor3d.extension.effect.bloom.BloomRenderPass") ||
                         name.equals("com.ardor3d.image.util.ImageLoader") ||
-                        name.equals("com.ardor3d.util.geom.BufferUtils") ||
+                        name.equals("com.ardor3d.ui.text.BMText") ||
                         name.equals("com.ardor3d.scenegraph.hint.LightCombineMode") ||
                         name.equals("com.ardor3d.scenegraph.hint.PickingHint") ||
                         name.equals("com.ardor3d.scenegraph.hint.TextureCombineMode") ||
@@ -391,6 +391,13 @@ public class Energy3DClassLoader {
                                     loadClass("com.ardor3d.image.loader.ImageLoader");
                                 } catch (ClassNotFoundException e) {
                                     if (logWriter != null) logWriter.println("  ✗ ERREUR: com.ardor3d.image.loader.ImageLoader non trouvé");
+                                    throw e;
+                                }
+                            } else if (name.equals("com.ardor3d.ui.text.BMText")) {
+                                try {
+                                    loadClass("com.ardor3d.scenegraph.Node");
+                                } catch (ClassNotFoundException e) {
+                                    if (logWriter != null) logWriter.println("  ✗ ERREUR: Node non trouvé avant BMText");
                                     throw e;
                                 }
                             }

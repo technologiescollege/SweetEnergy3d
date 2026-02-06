@@ -34,7 +34,7 @@
             <artifactId>energy3d</artifactId>
             <version>8.7.5</version>
             <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d_src/exe/energy3d.jar</systemPath>
+            <systemPath>${project.basedir}/../energy3d/exe/energy3d.jar</systemPath>
         </dependency>
         
         <!-- Ardor3D dependencies -->
@@ -43,21 +43,28 @@
             <artifactId>ardor3d-core</artifactId>
             <version>1.0</version>
             <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d_src/exe/lib/ardor3d/ardor3d-core.jar</systemPath>
+            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-core.jar</systemPath>
         </dependency>
         <dependency>
             <groupId>com.ardor3d</groupId>
             <artifactId>ardor3d-math</artifactId>
             <version>1.0</version>
             <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d_src/exe/lib/ardor3d/ardor3d-math.jar</systemPath>
+            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-math.jar</systemPath>
         </dependency>
         <dependency>
             <groupId>com.ardor3d</groupId>
             <artifactId>ardor3d-jogl</artifactId>
             <version>1.0</version>
             <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d_src/exe/lib/ardor3d/ardor3d-jogl.jar</systemPath>
+            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-jogl.jar</systemPath>
+        </dependency>
+        <dependency>
+            <groupId>com.ardor3d</groupId>
+            <artifactId>ardor3d-extras</artifactId>
+            <version>1.0</version>
+            <scope>system</scope>
+            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-extras.jar</systemPath>
         </dependency>
         <!-- ASM pour corriger le bytecode des stubs MaterialState/LightState (superclasse Object → RenderState) à l'exécution -->
         <dependency>
