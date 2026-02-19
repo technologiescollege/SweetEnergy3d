@@ -438,8 +438,12 @@ public class PlanExporter {
             // Export des arbres et buissons depuis les niveaux correspondants
             exportTreesAndBushes(home, foundation, foundationClass, originX, originY, scene, logWriter);
             
-            // TODO terrain3d: code conservé mais appel désactivé temporairement (reprendra plus tard)
-            // export3DTerrainObjects(home, foundation, foundationClass, originX, originY, scene, logWriter);
+            if (ENABLE_TERRAIN3D_EXPORT) {
+                export3DTerrainObjects(home, foundation, foundationClass, originX, originY, scene, logWriter);
+            } else {
+                logWriter.println("INFO: export terrain3d désactivé temporairement (TODO).");
+                logWriter.flush();
+            }
             
             logWriter.println("Ajout de la fondation à la Scene...");
             logWriter.flush();
@@ -2278,6 +2282,8 @@ public class PlanExporter {
     private static final boolean WALLS_TRAVERSE_REVERSE_ORDER = true;
     /** Tolérance (cm) pour considérer deux segments comme le même mur (arrondi pour clé de regroupement). */
     private static final double SEGMENT_KEY_TOLERANCE_CM = 1.0;
+    /** Code terrain3d conservé pour reprise ultérieure ; appel désactivé temporairement. */
+    private static final boolean ENABLE_TERRAIN3D_EXPORT = false;
 
     /**
      * Clé canonique pour un segment 2D (mur) : même clé = même trace au plan, tous niveaux confondus.

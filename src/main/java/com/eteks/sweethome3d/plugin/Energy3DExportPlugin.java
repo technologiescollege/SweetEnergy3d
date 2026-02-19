@@ -126,7 +126,6 @@ public class Energy3DExportPlugin extends Plugin {
                         pluginLogWriter.println("=== PLUGIN EXECUTE ===");
                         pluginLogWriter.println("Fichier de sortie: " + outputFile.getAbsolutePath());
                         pluginLogWriter.println("Nombre de murs dans le plan: " + (home.getWalls() != null ? home.getWalls().size() : 0));
-                        pluginLogWriter.println("Appel de PlanExporter.exportToEnergy3D()...");
                         pluginLogWriter.flush();
                     } catch (Exception e) {
                         e.printStackTrace();
@@ -135,11 +134,6 @@ public class Energy3DExportPlugin extends Plugin {
                     // Exporter le plan
                     boolean success = false;
                     try {
-                        if (pluginLogWriter != null) {
-                            pluginLogWriter.println("Appel de PlanExporter.exportToEnergy3D()...");
-                            pluginLogWriter.flush();
-                        }
-                        
                         success = PlanExporter.exportToEnergy3D(home, outputFile);
                         
                         if (pluginLogWriter != null) {
