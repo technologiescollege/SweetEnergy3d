@@ -28,49 +28,28 @@
             <systemPath>${project.basedir}/../SweetHome3D-7.5-portable/lib/SweetHome3D.jar</systemPath>
         </dependency>
         
-        <!-- Energy3D dependencies -->
+        <!-- Energy3D: version 1.0 matches energy3d/pom.xml (avoids "Missing artifact" for 8.7.5). Build Energy3D with Ant first so exe/energy3d.jar exists. -->
         <dependency>
             <groupId>org.concord.energy3d</groupId>
             <artifactId>energy3d</artifactId>
-            <version>8.7.5</version>
+            <version>1.0</version>
             <scope>system</scope>
             <systemPath>${project.basedir}/../energy3d/exe/energy3d.jar</systemPath>
         </dependency>
         
-        <!-- Ardor3D dependencies -->
-        <dependency>
-            <groupId>com.ardor3d</groupId>
-            <artifactId>ardor3d-core</artifactId>
-            <version>1.0</version>
-            <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-core.jar</systemPath>
-        </dependency>
-        <dependency>
-            <groupId>com.ardor3d</groupId>
-            <artifactId>ardor3d-math</artifactId>
-            <version>1.0</version>
-            <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-math.jar</systemPath>
-        </dependency>
-        <dependency>
-            <groupId>com.ardor3d</groupId>
-            <artifactId>ardor3d-jogl</artifactId>
-            <version>1.0</version>
-            <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-jogl.jar</systemPath>
-        </dependency>
-        <dependency>
-            <groupId>com.ardor3d</groupId>
-            <artifactId>ardor3d-extras</artifactId>
-            <version>1.0</version>
-            <scope>system</scope>
-            <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-extras.jar</systemPath>
-        </dependency>
+        <!-- Ardor3D JARs are in energy3d/exe/lib/ardor3d/ (not in Maven Central). Declared in profile so "Missing artifact" only when JARs exist. -->
         <!-- ASM pour corriger le bytecode des stubs MaterialState/LightState (superclasse Object → RenderState) à l'exécution -->
         <dependency>
             <groupId>org.ow2.asm</groupId>
             <artifactId>asm</artifactId>
             <version>9.6</version>
+        </dependency>
+        
+        <!-- Gson pour lire config.json -->
+        <dependency>
+            <groupId>com.google.code.gson</groupId>
+            <artifactId>gson</artifactId>
+            <version>2.10.1</version>
         </dependency>
     </dependencies>
     
@@ -123,6 +102,7 @@
                             <artifactSet>
                                 <includes>
                                     <include>org.ow2.asm:asm</include>
+                                    <include>com.google.code.gson:gson</include>
                                 </includes>
                             </artifactSet>
                             <minimizeJar>false</minimizeJar>
@@ -149,6 +129,7 @@
                                     <directory>${project.basedir}</directory>
                                     <includes>
                                         <include>ApplicationPlugin.properties</include>
+                                        <include>config.json</include>
                                     </includes>
                                 </resource>
                             </resources>
@@ -181,4 +162,46 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- Activate when Energy3D exe/lib/ardor3d exists (after Ant build). Avoids "Missing artifact" when path is absent. -->
+    <profiles>
+        <profile>
+            <id>ardor3d-system-jars</id>
+            <activation>
+                <file>
+                    <exists>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-core.jar</exists>
+                </file>
+            </activation>
+            <dependencies>
+                <dependency>
+                    <groupId>com.ardor3d</groupId>
+                    <artifactId>ardor3d-core</artifactId>
+                    <version>1.0</version>
+                    <scope>system</scope>
+                    <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-core.jar</systemPath>
+                </dependency>
+                <dependency>
+                    <groupId>com.ardor3d</groupId>
+                    <artifactId>ardor3d-math</artifactId>
+                    <version>1.0</version>
+                    <scope>system</scope>
+                    <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-math.jar</systemPath>
+                </dependency>
+                <dependency>
+                    <groupId>com.ardor3d</groupId>
+                    <artifactId>ardor3d-jogl</artifactId>
+                    <version>1.0</version>
+                    <scope>system</scope>
+                    <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-jogl.jar</systemPath>
+                </dependency>
+                <dependency>
+                    <groupId>com.ardor3d</groupId>
+                    <artifactId>ardor3d-extras</artifactId>
+                    <version>1.0</version>
+                    <scope>system</scope>
+                    <systemPath>${project.basedir}/../energy3d/exe/lib/ardor3d/ardor3d-extras.jar</systemPath>
+                </dependency>
+            </dependencies>
+        </profile>
+    </profiles>
 </project>

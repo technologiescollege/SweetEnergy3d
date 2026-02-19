@@ -1,6 +1,9 @@
 package com.eteks.sweethome3d.plugin;
 
 import java.io.File;
+import java.text.MessageFormat;
+import java.util.Locale;
+import java.util.ResourceBundle;
 
 import javax.swing.JFileChooser;
 import javax.swing.JOptionPane;
@@ -12,6 +15,32 @@ import com.eteks.sweethome3d.model.Home;
  * Plugin pour exporter les plans Sweet Home 3D vers Energy3D
  */
 public class Energy3DExportPlugin extends Plugin {
+
+    private static final String BUNDLE_BASE = "com.eteks.sweethome3d.plugin.Energy3DExportPlugin";
+
+    /** Retourne le ResourceBundle localisé du plugin (utilise le ClassLoader du plugin). */
+    private ResourceBundle getBundle() {
+        ClassLoader loader = getPluginClassLoader();
+        Locale locale = Locale.getDefault();
+        return ResourceBundle.getBundle(BUNDLE_BASE, locale, loader);
+    }
+
+    private String getString(String key) {
+        try {
+            return getBundle().getString(key);
+        } catch (Exception e) {
+            return key;
+        }
+    }
+
+    private String getString(String key, Object... args) {
+        try {
+            String pattern = getBundle().getString(key);
+            return MessageFormat.format(pattern, args);
+        } catch (Exception e) {
+            return key;
+        }
+    }
     
     @Override
     public PluginAction[] getActions() {
@@ -40,21 +69,20 @@ public class Energy3DExportPlugin extends Plugin {
                 if (home == null) {
                     JOptionPane.showMessageDialog(
                         null,
-                        "Aucun plan n'est ouvert dans Sweet Home 3D.\n\n" +
-                        "Veuillez ouvrir ou créer un plan avant d'exporter.",
-                        "Aucun plan",
+                        getString("msg.no_plan"),
+                        getString("msg.no_plan_title"),
                         JOptionPane.WARNING_MESSAGE
                     );
                     return;
                 }
                 
                 // Vérifier que le niveau "terrain" existe et contient au moins des murs ou une pièce
-                String validationError = PlanExporter.getExportValidationError(home);
-                if (validationError != null) {
+                String validationKey = PlanExporter.getExportValidationError(home);
+                if (validationKey != null) {
                     JOptionPane.showMessageDialog(
                         null,
-                        validationError,
-                        "Export impossible",
+                        getString(validationKey),
+                        getString("msg.export_impossible_title"),
                         JOptionPane.INFORMATION_MESSAGE
                     );
                     return;
@@ -62,10 +90,10 @@ public class Energy3DExportPlugin extends Plugin {
                 
                 // Demander à l'utilisateur où sauvegarder le fichier
                 JFileChooser fileChooser = new JFileChooser();
-                fileChooser.setDialogTitle("Exporter vers Energy3D");
+                fileChooser.setDialogTitle(getString("dialog.save_title"));
                 fileChooser.setFileFilter(new FileNameExtensionFilter(
-                    "Fichiers Energy3D (*.ng3)", "ng3"));
-                fileChooser.setSelectedFile(new File("plan_energy3d.ng3"));
+                    getString("file_filter.energy3d"), getString("file_filter.extension")));
+                fileChooser.setSelectedFile(new File(getString("file.default_name")));
                 
                 int result = fileChooser.showSaveDialog(null);
                 if (result == JFileChooser.APPROVE_OPTION) {
@@ -80,8 +108,8 @@ public class Energy3DExportPlugin extends Plugin {
                     if (outputFile.exists()) {
                         int overwrite = JOptionPane.showConfirmDialog(
                             null,
-                            "Le fichier existe déjà :\n" + outputFile.getName() + "\n\nVoulez-vous l'écraser ?",
-                            "Fichier existant",
+                            getString("msg.file_exists", outputFile.getName()),
+                            getString("msg.file_exists_title"),
                             JOptionPane.YES_NO_OPTION,
                             JOptionPane.QUESTION_MESSAGE
                         );
@@ -134,10 +162,8 @@ public class Energy3DExportPlugin extends Plugin {
                         
                         JOptionPane.showMessageDialog(
                             null,
-                            "Erreur: Classes Energy3D non disponibles.\n\n" +
-                            "Vérifiez que les dépendances Energy3D sont correctement configurées.\n\n" +
-                            "Détails: " + e.getMessage(),
-                            "Erreur de chargement",
+                            getString("msg.energy3d_not_available", e.getMessage() != null ? e.getMessage() : ""),
+                            getString("msg.energy3d_not_available_title"),
                             JOptionPane.ERROR_MESSAGE
                         );
                     } catch (Throwable t) {
@@ -161,56 +187,49 @@ public class Energy3DExportPlugin extends Plugin {
                     if (success) {
                         JOptionPane.showMessageDialog(
                             null,
-                            String.format(
-                                "Plan exporté avec succès vers Energy3D.\n\n" +
-                                "Fichier: %s\n" +
-                                "Taille: %d bytes\n\n" +
-                                "Le fichier est au format binaire .ng3 compatible Energy3D.",
-                                outputFile.getAbsolutePath(),
-                                outputFile.length()
-                            ),
-                            "Export réussi",
+                            getString("msg.export_success", outputFile.getAbsolutePath(), outputFile.length()),
+                            getString("msg.export_success_title"),
                             JOptionPane.INFORMATION_MESSAGE
                         );
                     } else {
                         // Réafficher le message de validation si l'export a échoué pour cause de terrain
-                        String validationMsg = PlanExporter.getExportValidationError(home);
-                        if (validationMsg != null) {
+                        validationKey = PlanExporter.getExportValidationError(home);
+                        if (validationKey != null) {
                             JOptionPane.showMessageDialog(
                                 null,
-                                validationMsg,
-                                "Export impossible",
+                                getString(validationKey),
+                                getString("msg.export_impossible_title"),
                                 JOptionPane.INFORMATION_MESSAGE
                             );
                             return;
                         }
-                        String errorMessage = "Erreur lors de l'export du plan.\n\n";
+                        String errorMessage = getString("msg.export_error_intro");
                         
                         // Vérifier si le fichier existe
                         if (outputFile.exists()) {
                             if (outputFile.length() == 0) {
-                                errorMessage += "Le fichier a été créé mais est vide.\n";
+                                errorMessage += getString("msg.export_error_file_empty");
                             } else {
-                                errorMessage += "Le fichier existe mais pourrait être corrompu.\n";
+                                errorMessage += getString("msg.export_error_file_corrupt");
                             }
                         } else {
-                            errorMessage += "Le fichier n'a pas été créé.\n";
+                            errorMessage += getString("msg.export_error_file_not_created");
                         }
                         
                         // Vérifier les permissions
                         if (outputFile.getParentFile() != null) {
                             if (!outputFile.getParentFile().canWrite()) {
-                                errorMessage += "\nPas de permission d'écriture dans le répertoire: " + outputFile.getParentFile().getAbsolutePath();
+                                errorMessage += getString("msg.export_error_no_write_permission", outputFile.getParentFile().getAbsolutePath());
                             }
                         }
                         
-                        errorMessage += "\n\nVeuillez consulter le fichier log pour plus de détails:\n" + 
-                                       new File(outputFile.getParentFile(), outputFile.getName() + ".log").getAbsolutePath();
+                        errorMessage += getString("msg.export_error_see_log",
+                            new File(outputFile.getParentFile(), outputFile.getName() + ".log").getAbsolutePath());
                         
                         JOptionPane.showMessageDialog(
                             null,
                             errorMessage,
-                            "Erreur d'export",
+                            getString("msg.export_error_title"),
                             JOptionPane.ERROR_MESSAGE
                         );
                     }
@@ -219,8 +238,8 @@ public class Energy3DExportPlugin extends Plugin {
             } catch (Exception e) {
                 JOptionPane.showMessageDialog(
                     null,
-                    "Erreur lors de l'export:\n" + e.getMessage(),
-                    "Erreur",
+                    getString("msg.generic_error", e.getMessage() != null ? e.getMessage() : ""),
+                    getString("msg.generic_error_title"),
                     JOptionPane.ERROR_MESSAGE
                 );
                 e.printStackTrace();

@@ -49,4 +49,8 @@ public class SceneManager {
     public void refresh() {
         // no-op
     }
+
+    public void cursorWait(boolean wait) {
+        // no-op en headless
+    }
 }

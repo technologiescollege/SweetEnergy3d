@@ -1,0 +1,23 @@
+{
+ "external_wall": {
+    "keywords": ["extérieur", "exterieur", "outside", "outer", "external", "outdoor"]
+  },
+  "internal_wall": {
+    "keywords": ["intérieur", "interieur", "cloison", "inside", "interior", "internal", "indoor"]
+  },
+  "roof": {
+    "keywords": ["toit", "roof", "toiture"]
+  },
+  "foundation": {
+    "keywords": ["terrain", "fondation", "foundation", "ground"]
+  },
+  "trees": {
+    "keywords": ["arbre", "tree", "arbres", "trees"]
+  },
+  "bushes": {
+    "keywords": ["buisson", "bush", "buissons", "bushes", "haie", "hedge"]
+  },
+  "terrain3d": {
+    "keywords": ["3dterrain", "terrain3d", "3d terrain", "terrain 3d"]
+  }
+}
