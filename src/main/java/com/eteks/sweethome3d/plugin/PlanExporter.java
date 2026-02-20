@@ -2615,6 +2615,7 @@ public class PlanExporter {
             double depthCm = pieceDepth != null ? pieceDepth.doubleValue() : 50.0;
 
             double heightUnits = heightCm * SCALE_CM_TO_ENERGY3D;
+            boolean lengthUsesWidthAxis = widthCm >= depthCm;
             double lengthUnits = Math.max(widthCm, depthCm) * SCALE_CM_TO_ENERGY3D;
             double thicknessCm = Math.min(widthCm, depthCm);
             double thicknessM = thicknessCm / 100.0;
@@ -2637,46 +2638,52 @@ public class PlanExporter {
             if (MIRROR_FLIP_X) xAbs = -xAbs;
             if (ROTATE_180_Z) yAbs = -yAbs;
 
+            // Si l'objet est hors fondation, ne pas le recaler à l'intérieur : on l'ignore.
             double uCenter = projectPointOnLineScale(xAbs, yAbs, p0x, p0y, p2x, p2y);
             double vCenter = projectPointOnLineScale(xAbs, yAbs, p0x, p0y, p1x, p1y);
-            uCenter = Math.max(0, Math.min(1, uCenter));
-            vCenter = Math.max(0, Math.min(1, vCenter));
-
-            double normalizedAngle = ((pieceAngle % (2 * Math.PI)) + (2 * Math.PI)) % (2 * Math.PI);
-            double angleFromU = normalizedAngle % (Math.PI / 2);
-            boolean useUDirection = (angleFromU < Math.PI / 4) || (angleFromU > 3 * Math.PI / 4);
-
-            double lengthInUV;
-            double uStart;
-            double vStart;
-            double uEnd;
-            double vEnd;
-            if (useUDirection) {
-                lengthInUV = lengthUnits / edgeLength02;
-                uStart = Math.max(0, uCenter - lengthInUV / 2.0);
-                vStart = vCenter;
-                uEnd = Math.min(1, uCenter + lengthInUV / 2.0);
-                vEnd = vCenter;
-                if (uEnd - uStart < lengthInUV) {
-                    if (uStart == 0) {
-                        uEnd = Math.min(1, lengthInUV);
-                    } else if (uEnd == 1) {
-                        uStart = Math.max(0, 1 - lengthInUV);
-                    }
+            if (uCenter < 0 || uCenter > 1 || vCenter < 0 || vCenter > 1) {
+                if (logWriter != null && skipped < 15) {
+                    logWriter.println("    Objet buisson hors fondation ignoré : \"" + (pieceName != null ? pieceName : "(sans nom)") + "\"");
+                    logWriter.flush();
                 }
-            } else {
-                lengthInUV = lengthUnits / edgeLength01;
-                uStart = uCenter;
-                vStart = Math.max(0, vCenter - lengthInUV / 2.0);
-                uEnd = uCenter;
-                vEnd = Math.min(1, vCenter + lengthInUV / 2.0);
-                if (vEnd - vStart < lengthInUV) {
-                    if (vStart == 0) {
-                        vEnd = Math.min(1, lengthInUV);
-                    } else if (vEnd == 1) {
-                        vStart = Math.max(0, 1 - lengthInUV);
-                    }
+                skipped++;
+                continue;
+            }
+
+            // Orientation exacte depuis l'angle du meuble SH3D.
+            // Si la longueur provient de depth (et non width), l'axe principal est perpendiculaire à pieceAngle.
+            double orientedAngle = lengthUsesWidthAxis ? pieceAngle : (pieceAngle + Math.PI / 2.0);
+            double halfLenCm = (lengthUnits / SCALE_CM_TO_ENERGY3D) * 0.5;
+            double dxCm = Math.cos(orientedAngle) * halfLenCm;
+            double dyCm = Math.sin(orientedAngle) * halfLenCm;
+
+            double xStartAbs = ((xCm - dxCm) - originX) * SCALE_CM_TO_ENERGY3D;
+            double yStartAbs = ((yCm - dyCm) - originY) * SCALE_CM_TO_ENERGY3D;
+            double xEndAbs = ((xCm + dxCm) - originX) * SCALE_CM_TO_ENERGY3D;
+            double yEndAbs = ((yCm + dyCm) - originY) * SCALE_CM_TO_ENERGY3D;
+            if (MIRROR_FLIP_X) {
+                xStartAbs = -xStartAbs;
+                xEndAbs = -xEndAbs;
+            }
+            if (ROTATE_180_Z) {
+                yStartAbs = -yStartAbs;
+                yEndAbs = -yEndAbs;
+            }
+
+            double uStart = projectPointOnLineScale(xStartAbs, yStartAbs, p0x, p0y, p2x, p2y);
+            double vStart = projectPointOnLineScale(xStartAbs, yStartAbs, p0x, p0y, p1x, p1y);
+            double uEnd = projectPointOnLineScale(xEndAbs, yEndAbs, p0x, p0y, p2x, p2y);
+            double vEnd = projectPointOnLineScale(xEndAbs, yEndAbs, p0x, p0y, p1x, p1y);
+
+            // Si le segment sort de la fondation, ignorer l'objet (pas de clamp/recalage).
+            if (uStart < 0 || uStart > 1 || vStart < 0 || vStart > 1
+                    || uEnd < 0 || uEnd > 1 || vEnd < 0 || vEnd > 1) {
+                if (logWriter != null && skipped < 15) {
+                    logWriter.println("    Buisson partiellement hors fondation ignoré : \"" + (pieceName != null ? pieceName : "(sans nom)") + "\"");
+                    logWriter.flush();
                 }
+                skipped++;
+                continue;
             }
 
             final double SNAP_GRID = 1e-5;
